@@ -489,3 +489,67 @@ fn limits_includes_failed_probe_stderr_in_json_export() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+// #444: a contract error from the Vault (uninitialized deposit) is not
+// evidence of a resource limit. Do not report a fake best ceiling.
+#[test]
+fn limits_uninitialized_vault_failure_is_not_reported_as_ceiling() {
+    let wasm = ensure_vault_wasm();
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "deposit",
+        "--ramp",
+        "amount",
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("deposit"), "{stderr}");
+    assert!(stderr.contains("amount=1"), "{stderr}");
+    assert!(
+        stderr.contains("before a resource limit was verified"),
+        "{stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("last successful"));
+}
+
+// #444: success at 1 and 2 must not let us report 2 as a budget ceiling
+// when the contract itself rejects count 4.
+#[test]
+fn limits_stops_when_contract_rejects_after_successful_probes() {
+    // Force an incremental build in case a stale vault.wasm was cached locally.
+    let built = Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "vault",
+            "--target",
+            "wasm32v1-none",
+            "--release",
+        ])
+        .current_dir(workspace_root())
+        .status()
+        .expect("failed to run cargo");
+    assert!(built.success());
+    let wasm = ensure_vault_wasm();
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "reject_after_three",
+        "--ramp",
+        "count",
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("reject_after_three"), "{stderr}");
+    assert!(stderr.contains("count=4"), "{stderr}");
+    assert!(
+        stderr.contains("before a resource limit was verified"),
+        "{stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("last successful"));
+}
