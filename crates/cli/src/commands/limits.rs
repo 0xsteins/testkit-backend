@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::panic;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 use clap::Args;
@@ -44,8 +44,7 @@ pub enum ProbeFailureCategory {
     /// either rejected the ramp value with its own validation error or
     /// exhausted a host resource budget.
     ExitFailure,
-    /// A contract returned an error or trapped without exhausting the budget.
-    /// This is not evidence of a resource ceiling.
+    /// A contract rejected or trapped before exhausting a resource budget.
     ContractFailure,
     /// The probe exceeded `--probe-timeout` and was killed by the parent
     /// before it could finish.
@@ -369,9 +368,9 @@ pub struct ProbeArgs {
 /// 2. **Spawn one child per probe.** The parent re-executes itself as
 ///    `soroban-testkit __limits-probe` (hidden from `--help`) with the
 ///    ramp value passed through `--value`. See [`run_probe`] for the child
-///    half. The child's `Env` is a throwaway registered from the `.wasm`
-///    and is dropped when the child exits, so no state leaks between
-///    probes.
+///    half. The command creates no temporary Cargo projects and launches
+///    no shell; the child's in-memory `Env` is disposable. `ProbeChild`
+///    kills and reaps on ordinary interruption, error and early return.
 /// 3. **Bound the probe.** The parent waits up to `--probe-timeout` in
 ///    [`wait_with_timeout`]. If the child finishes, its exit status decides
 ///    the outcome; if it overruns, the parent kills it and records a
@@ -434,7 +433,7 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     let mut hit_upper_bound = false;
 
     let mut probe = |value: u32| -> Result<ProbeOutcome, CliError> {
-        let mut child = Command::new(&self_exe)
+        let child = Command::new(&self_exe)
             .arg("__limits-probe")
             .arg("--contract")
             .arg(&args.contract)
@@ -460,9 +459,12 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
                     ProbeFailureCategory::SpawnFailure.guidance()
                 ))
             })?;
+        // Retain upstream's RAII cleanup on early returns and failures.
+        let mut child = ProbeChild { child };
 
-        let status = wait_with_timeout(&mut child, probe_timeout)?;
+        let status = wait_with_timeout(&mut child.child, probe_timeout)?;
         let stderr = child
+            .child
             .stderr
             .take()
             .map_or(Ok(String::new()), |mut stream| {
@@ -471,21 +473,23 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
                 stream.read_to_string(&mut buffer).map(|_| buffer)
             })
             .map_err(|err| CliError(format!("failed to read probe stderr: {err}")))?;
+
         let outcome = match status {
             Some(status) if status.success() => ProbeOutcome::Succeeded,
-            // Signal aborts are not known to be contract errors or limits.
             Some(status) if status.code().is_none() => {
                 ProbeOutcome::Failed(ProbeFailureCategory::Abort)
             }
             Some(_) => ProbeOutcome::Failed(classify_probe_exit_stderr(&stderr)),
             None => ProbeOutcome::Failed(ProbeFailureCategory::TimedOut),
         };
+
         if let ProbeOutcome::Failed(category) = outcome {
-            // A rejected invocation cannot establish a resource ceiling,
-            // even when smaller ramp values successfully execute.
+            // A contract failure cannot establish a budget ceiling, even if
+            // earlier, lower ramp values succeeded.
             if category == ProbeFailureCategory::ContractFailure {
                 return Err(CliError(format!(
-                    "contract function {:?} failed at {}={} before a resource limit was verified;                      check the contract's validation and trap logic; probe stderr: {}",
+                    "contract function {:?} failed at {}={} before a resource limit was verified; \
+                     check the contract's validation and trap logic; probe stderr: {}",
                     args.function,
                     args.ramp,
                     value,
@@ -638,7 +642,22 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Builds actionable guidance explaining how to reproduce the discovered ceiling locally.
+/// Shell-quote a single argument for copyable POSIX-shell guidance.
+/// Actual probes use Command::arg directly and never launch a shell or Cargo.
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_./:=+".contains(&byte))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// Builds shell-safe instructions for reproducing the discovered ceiling.
+/// Spaces and single quotes in the WASM path remain one argument.
 pub fn build_reproduction_guidance(
     contract: &str,
     function: &str,
@@ -646,10 +665,14 @@ pub fn build_reproduction_guidance(
     best: u32,
     arg_values: &[String],
 ) -> String {
-    let mut cmd =
-        format!("soroban-testkit limits --contract {contract} --fn {function} --ramp {ramp}");
+    let mut cmd = format!(
+        "soroban-testkit limits --contract {} --fn {} --ramp {}",
+        shell_quote(contract),
+        shell_quote(function),
+        shell_quote(ramp)
+    );
     for arg in arg_values {
-        cmd.push_str(&format!(" --arg {arg}"));
+        cmd.push_str(&format!(" --arg {}", shell_quote(arg)));
     }
     format!(
         "invoke `{function}` with `{ramp}` = {best} in a test environment; to re-verify the boundary via CLI run: `{cmd}`"
@@ -767,33 +790,69 @@ pub fn run_probe(args: ProbeArgs) -> Result<(), CliError> {
     }
 }
 
-/// Waits up to `timeout` for `child` to exit, polling rather than blocking
-/// so an exceeded timeout can kill it instead of waiting forever. Returns
-/// `Some(status)` on a normal exit within the timeout, or `None` if the
-/// child was killed for running too long — which the caller classifies as
-/// [`ProbeFailureCategory::TimedOut`]. A status with no exit code means the
-/// child was terminated by a signal ([`ProbeFailureCategory::Abort`]).
-/// Killing and reaping here is what guarantees a timed-out probe's
-/// temporary environment does not outlive the probe.
-fn wait_with_timeout(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> Result<Option<std::process::ExitStatus>, CliError> {
-    let deadline = Instant::now() + timeout;
+/// Owns one isolated probe. On ordinary error, early return or unwinding,
+/// terminate and reap any child still running. No temporary Cargo project or
+/// source directory is created by this command. An uncatchable OS termination
+/// of the parent cannot invoke Drop.
+struct ProbeChild {
+    child: Child,
+}
+
+impl Drop for ProbeChild {
+    fn drop(&mut self) {
+        if let Ok(Some(_)) = self.child.try_wait() {
+            return;
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Poll one child until it exits or exceeds its deadline. A timeout kills
+/// and reaps before returning None. Errors name the process rather than
+/// silently claiming a resource ceiling. ProbeChild handles early errors.
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<Option<ExitStatus>, CliError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| CliError("probe timeout is too large for the host clock".to_string()))?;
     loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|err| CliError(format!("failed to poll probe: {err}")))?
-        {
+        if let Some(status) = child.try_wait().map_err(|err| {
+            CliError(format!(
+                "failed to poll isolated probe process {}: {err}",
+                child.id()
+            ))
+        })? {
             return Ok(Some(status));
         }
         if Instant::now() >= deadline {
-            // Best-effort: the process may have exited between the last
-            // try_wait and here, in which case kill() harmlessly errors
-            // (already-exited processes can't be killed) — ignored, since
-            // either way the outcome from here on is "timed out".
-            let _ = child.kill();
-            let _ = child.wait();
+            // A child can exit between polling and kill. In that race,
+            // try_wait reaps it; otherwise report the failed termination.
+            match child.kill() {
+                Ok(()) => {
+                    child.wait().map_err(|err| {
+                        CliError(format!(
+                            "failed to reap timed-out probe process {}: {err}",
+                            child.id()
+                        ))
+                    })?;
+                }
+                Err(kill_err) => match child.try_wait() {
+                    Ok(Some(_)) => {} // Already exited and reaped.
+                    Ok(None) => {
+                        return Err(CliError(format!(
+                            "failed to terminate timed-out probe process {}: {kill_err}",
+                            child.id()
+                        )));
+                    }
+                    Err(poll_err) => {
+                        return Err(CliError(format!(
+                            "failed to terminate or poll timed-out probe process {}: \
+                             kill: {kill_err}; poll: {poll_err}",
+                            child.id()
+                        )));
+                    }
+                },
+            }
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -1800,6 +1859,72 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "should have killed the child near the timeout, not waited for it to finish"
         );
+    }
+
+    #[test]
+    fn shell_quote_protects_paths_with_spaces_and_single_quotes() {
+        assert_eq!(shell_quote("vault.wasm"), "vault.wasm");
+        assert_eq!(shell_quote("my dir/vault.wasm"), "'my dir/vault.wasm'");
+        assert_eq!(shell_quote("can't run.wasm"), "'can'\\''t run.wasm'");
+        assert_eq!(shell_quote("$(touch bad)"), "'$(touch bad)'");
+        let guide = build_reproduction_guidance(
+            "my dir/can't run.wasm",
+            "batch_payout",
+            "recipients",
+            3,
+            &["memo=hello world".into()],
+        );
+        assert!(guide.contains("--contract 'my dir/can'\\''t run.wasm'"));
+        assert!(guide.contains("--arg 'memo=hello world'"));
+    }
+
+    #[test]
+    fn completed_probe_retains_actual_nonzero_exit_status() {
+        let mut child = Command::new("sh").args(["-c", "exit 17"]).spawn().unwrap();
+        let status = wait_with_timeout(&mut child, Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.code(), Some(17));
+        assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(17));
+    }
+
+    #[test]
+    fn timed_out_probe_is_killed_and_reaped() {
+        let mut child = Command::new("sleep").arg("10").spawn().unwrap();
+        assert!(wait_with_timeout(&mut child, Duration::from_millis(40))
+            .unwrap()
+            .is_none());
+        assert!(child.try_wait().unwrap().is_some(), "child must be reaped");
+    }
+
+    #[test]
+    fn abandoned_probe_guard_prevents_late_artifacts() {
+        let root = std::env::temp_dir().join(format!("stk-interrupted-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("late-artifact");
+        let child = Command::new("sh")
+            .args(["-c", "sleep 1; touch \"$1\"", "_"])
+            .arg(&marker)
+            .current_dir(&root)
+            .spawn()
+            .unwrap();
+        {
+            // Simulates an early return/error: the guard kills the child.
+            let _probe = ProbeChild { child };
+        }
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(!marker.exists(), "an abandoned probe wrote after Drop");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn oversized_timeout_is_actionable_and_guard_still_reaps() {
+        let child = Command::new("sleep").arg("10").spawn().unwrap();
+        let mut guard = ProbeChild { child };
+        let err = wait_with_timeout(&mut guard.child, Duration::MAX).unwrap_err();
+        assert!(err.0.contains("too large for the host clock"), "{}", err.0);
+        drop(guard);
     }
 
     // ---- #244: export results ----

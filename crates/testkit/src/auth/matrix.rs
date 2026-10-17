@@ -493,13 +493,6 @@ mod tests {
             .assert_enforced();
     }
 
-    fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
-        err.downcast_ref::<String>()
-            .cloned()
-            .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
-            .unwrap_or_default()
-    }
-
     #[test]
     fn a_duplicated_allowed_address_is_checked_once_not_twice() {
         let env = TestEnv::new();

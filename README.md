@@ -122,12 +122,27 @@ read/write counts and transaction size aren't reported (they come from a
 network-side simulated footprint this crate doesn't produce); instructions
 and memory, measured locally, are.
 
+Probe execution uses the already-built `soroban-testkit` executable directly,
+not `cargo run` or a throwaway Cargo project. Each probe child is killed and
+reaped on timeout; an early ordinary error/return also invokes a cleanup
+guard. This guard cannot run if the operating system forcibly kills the
+parent process. Contract paths are passed as single OS arguments; copyable
+reproduction instructions shell-quote paths containing spaces or quotes.
+
 `audit` accepts three scan roots: a crate directory (walked recursively for
 `.rs` files), a single `.rs` file, or `-` to read Rust source from stdin.
 While walking a directory it skips `target/`, `node_modules/`, and hidden
 directories such as `.git/` and `.github/`, so build output and vendored or
 tooling code is never reported. A path that doesn't exist is an actionable
 error rather than an empty "no findings" run.
+
+**Audit limitation:** the linter inspects written Rust source only. It does
+not expand procedural macros (including Soroban contract macros) or
+`macro_rules!`, so generated entry points and generated bodies may go
+unexamined. A clean report does not certify generated code. The limitation
+is included in text, JSON (`summary.limitations`) and SARIF
+(`runs[].properties.limitations`) results. Inspect expanded source
+separately when generated code matters.
 
 ## Status
 

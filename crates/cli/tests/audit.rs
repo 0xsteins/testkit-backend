@@ -260,6 +260,63 @@ fn audit_formats_handle_clean_crate_consistently() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn audit_reports_macro_generated_source_caveat_in_all_formats() {
+    let source = br#"
+        macro_rules! generated_vault {
+            () => {
+                pub fn withdraw(from: Address) { debit(from); }
+            };
+        }
+        generated_vault!();
+    "#;
+    let text = run_with_stdin(&["audit", "-", "--format", "text"], source);
+    assert!(text.status.success());
+    let report = String::from_utf8_lossy(&text.stdout);
+    assert!(report.contains("audit: no findings"), "{report}");
+    assert!(report.contains("macro_rules!"), "{report}");
+    assert!(report.contains("not expanded"), "{report}");
+
+    let json = run_with_stdin(&["audit", "-", "--format", "json"], source);
+    assert!(json.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 0);
+    assert!(report["summary"]["limitations"][0]
+        .as_str()
+        .unwrap()
+        .contains("not expanded"));
+
+    let sarif = run_with_stdin(&["audit", "-", "--format", "sarif"], source);
+    assert!(sarif.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&sarif.stdout).unwrap();
+    assert_eq!(report["runs"][0]["results"].as_array().unwrap().len(), 0);
+    assert!(report["runs"][0]["properties"]["limitations"][0]
+        .as_str()
+        .unwrap()
+        .contains("generated entry points"));
+}
+
+#[test]
+fn audit_reports_written_contractimpl_functions_but_not_generated_bodies() {
+    let text = run_with_stdin(
+        &["audit", "-", "--format", "text"],
+        UNAUTHORIZED_ENTRY_POINT.as_bytes(),
+    );
+    assert!(text.status.success());
+    let report = String::from_utf8_lossy(&text.stdout);
+    assert!(report.contains("missing-require-auth"), "{report}");
+    assert!(report.contains("source-only scan"), "{report}");
+}
+
+#[test]
+fn audit_help_explains_macro_expansion_boundary() {
+    let output = run(&["audit", "--help"]);
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("macro_rules!"), "{help}");
+    assert!(help.contains("generated code"), "{help}");
+}
+
 // #436: Unix paths may contain non-UTF-8 bytes; text output must be legible.
 #[cfg(unix)]
 #[test]

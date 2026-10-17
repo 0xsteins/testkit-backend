@@ -44,6 +44,8 @@ for crate_rel in "${crates[@]}"; do
     exit 1
   fi
 
+  # Cargo's `version.workspace = true` inherits the package version from
+  # [workspace.package], rather than using a per-crate literal version.
   # Check if version is inherited from workspace
   if grep -Eq '^[[:space:]]*version\.workspace[[:space:]]*=[[:space:]]*true' "$manifest"; then
     resolved_version="$workspace_version"

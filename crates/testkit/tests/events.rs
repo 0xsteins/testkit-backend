@@ -2,9 +2,7 @@
 //! the raw captured values, and the captured scope must span nested
 //! sub-contract calls while resetting at each top-level invocation.
 
-use soroban_sdk::{
-    contract, contractimpl, symbol_short, Address, Env, IntoVal, Symbol, Val,
-};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, IntoVal, Symbol, Val};
 use soroban_testkit::core::TestEnv;
 use soroban_testkit::events::{decode_topic_diagnostic, CapturedEvent, EventLog};
 

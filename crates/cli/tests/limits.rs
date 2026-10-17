@@ -28,6 +28,11 @@ fn ensure_vault_wasm() -> PathBuf {
     let wasm = workspace_root().join("target/wasm32v1-none/release/vault.wasm");
     if !wasm.exists() {
         let build = Command::new("cargo")
+            // The outer cargo-llvm-cov run instruments native tests. This nested
+            // WASM fixture build must not inherit its unsupported coverage flags.
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("CARGO_TARGET_WASM32V1_NONE_RUSTFLAGS")
             .args([
                 "build",
                 "-p",
@@ -271,7 +276,7 @@ fn limits_export_json_includes_limitations_audit_and_sanitizes_temp_paths() {
 
     // Verify audit structure is present
     assert!(json["audit"].is_object());
-    assert!(json["audit"]["steps"].as_array().unwrap().len() > 0);
+    assert!(!json["audit"]["steps"].as_array().unwrap().is_empty());
     assert_eq!(json["audit"]["final_success"], json["best"]);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -490,6 +495,71 @@ fn limits_includes_failed_probe_stderr_in_json_export() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn limits_launches_wasm_from_a_path_with_spaces_without_shell_splitting() {
+    let wasm = ensure_vault_wasm();
+    let root = std::env::temp_dir().join(format!("stk limit paths {}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let copy = root.join("contract copy.wasm");
+    std::fs::copy(&wasm, &copy).unwrap();
+
+    let output = run(&[
+        "limits",
+        "--contract",
+        copy.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("--contract 'contract copy.wasm'"),
+        "copyable guidance must quote the filename: {stdout}"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn limits_timeout_creates_no_temporary_cargo_probe_project() {
+    let wasm = ensure_vault_wasm();
+    let root = std::env::temp_dir().join(format!("stk-probe-empty-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-testkit"))
+        .args([
+            "limits",
+            "--contract",
+            wasm.to_str().unwrap(),
+            "--fn",
+            "batch_payout",
+            "--ramp",
+            "recipients",
+            "--probe-timeout",
+            "0",
+        ])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    // Either the immediate deadline fails the first probe, or a very fast
+    // probe may complete; neither outcome creates a disposable Cargo project.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() || stderr.contains("timed-out"),
+        "unexpected probe error: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&root).unwrap().count(),
+        0,
+        "limits must not leave probe Cargo.toml/src/target directories"
+    );
+    std::fs::remove_dir(&root).unwrap();
+}
+
 // #444: a contract error from the Vault (uninitialized deposit) is not
 // evidence of a resource limit. Do not report a fake best ceiling.
 #[test]
@@ -519,20 +589,7 @@ fn limits_uninitialized_vault_failure_is_not_reported_as_ceiling() {
 // when the contract itself rejects count 4.
 #[test]
 fn limits_stops_when_contract_rejects_after_successful_probes() {
-    // Force an incremental build in case a stale vault.wasm was cached locally.
-    let built = Command::new("cargo")
-        .args([
-            "build",
-            "-p",
-            "vault",
-            "--target",
-            "wasm32v1-none",
-            "--release",
-        ])
-        .current_dir(workspace_root())
-        .status()
-        .expect("failed to run cargo");
-    assert!(built.success());
+    // Reuse the WASM fixture prepared by the CI workflow.
     let wasm = ensure_vault_wasm();
     let output = run(&[
         "limits",

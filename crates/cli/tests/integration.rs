@@ -95,25 +95,33 @@ fn audit_scans_macro_entry_points_from_stdin() {
 
 #[test]
 fn limits_finds_the_real_mainnet_write_ceiling_for_batch_payout() {
-    let build = Command::new("cargo")
-        .args([
-            "build",
-            "-p",
-            "vault",
-            "--target",
-            "wasm32v1-none",
-            "--release",
-        ])
-        .current_dir(workspace_root())
-        .status()
-        .expect("failed to build vault.wasm");
-    assert!(
-        build.success(),
-        "failed to compile examples/vault for documented wasm target `wasm32v1-none`. \
-         Ensure the target is installed: `rustup target add wasm32v1-none`."
-    );
-
     let wasm = workspace_root().join("target/wasm32v1-none/release/vault.wasm");
+    // Reuse an uninstrumented WASM fixture prepared before native LLVM
+    // coverage starts. A nested build during cargo-llvm-cov would otherwise
+    // inherit -C instrument-coverage, unsupported by wasm32v1-none.
+    if !wasm.exists() {
+        let build = Command::new("cargo")
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("CARGO_TARGET_WASM32V1_NONE_RUSTFLAGS")
+            .args([
+                "build",
+                "-p",
+                "vault",
+                "--target",
+                "wasm32v1-none",
+                "--release",
+            ])
+            .current_dir(workspace_root())
+            .status()
+            .expect("failed to build vault.wasm");
+        assert!(
+            build.success(),
+            "failed to compile examples/vault for documented wasm target `wasm32v1-none`. \
+             Ensure the target is installed: `rustup target add wasm32v1-none`."
+        );
+    }
+
     let output = run(&[
         "limits",
         "--contract",

@@ -174,25 +174,52 @@ fn output_dir_with_text_format_is_rejected_with_actionable_error() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn output_dir_with_text_format_and_open_is_accepted() {
-    // --format text --open --output-dir is the one valid combination:
-    // it generates an HTML report into the given directory and opens it.
-    // This test only checks that the CLI accepts the argument combination
-    // (it will fail later because cargo-llvm-cov is not necessarily installed,
-    // but argument validation must pass).
-    let output = run(&[
-        "coverage",
-        "--format",
-        "text",
-        "--open",
-        "--output-dir",
-        "/tmp/stk-test-open-dir",
-    ]);
+    use std::os::unix::fs::PermissionsExt;
+
+    // Stub Cargo so this integration test checks argument validation without
+    // recursively running cargo-llvm-cov while the outer coverage job is
+    // instrumenting this very test binary. The previous test could hang CI.
+    let root = std::env::temp_dir().join(format!("stk-coverage-accept-{}", std::process::id()));
+    let bin = root.join("bin");
+    let report = root.join("report");
+    std::fs::create_dir_all(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    std::fs::write(&cargo, "#!/bin/sh\nexit 17\n").unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var_os("PATH")
+            .unwrap_or_default()
+            .to_string_lossy()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-testkit"))
+        .args([
+            "coverage",
+            "--format",
+            "text",
+            "--open",
+            "--output-dir",
+            report.to_str().unwrap(),
+        ])
+        .env("PATH", path)
+        .current_dir(workspace_root())
+        .output()
+        .unwrap();
+
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // The combination must NOT be rejected with the incompatible-format error
+    assert!(!output.status.success(), "stub cargo should exit nonzero");
+    assert!(
+        stderr.contains("cargo llvm-cov exited with exit status: 17"),
+        "valid flags must reach the stubbed cargo command: {stderr}"
+    );
     assert!(
         !stderr.contains("--output-dir is not valid with --format text"),
         "valid combination was wrongly rejected: {stderr}"
     );
+    std::fs::remove_dir_all(&root).unwrap();
 }

@@ -65,7 +65,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Warnings are denied via the workflow-level RUSTDOCFLAGS above.
-      - run: cargo doc --workspace --no-deps
+      # Avoid concurrent rustdoc writers racing in shared target/doc metadata.
+      - run: cargo doc --workspace --no-deps -j 1
 
   audit:
     name: cargo audit
@@ -97,6 +98,11 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
+      # The integration suite invokes the built contract as actual WASM. Compile
+      # it before llvm-cov sets native-only instrument-coverage rustflags.
+      # The test reuses this fixture rather than recompiling inside llvm-cov.
+      - name: Prepare uninstrumented WASM fixture
+        run: cargo build -p vault --target wasm32v1-none --release --locked
       - name: coverage (network disabled)
         run: bash .github/scripts/test-no-network.sh coverage
       - uses: codecov/codecov-action@v4

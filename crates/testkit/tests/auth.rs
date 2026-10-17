@@ -6,13 +6,6 @@ use soroban_sdk::{contract, contractimpl, Address, Env, IntoVal};
 use soroban_testkit::auth::AuthMatrix;
 use soroban_testkit::core::TestEnv;
 
-fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
-    err.downcast_ref::<String>()
-        .cloned()
-        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
-        .unwrap_or_default()
-}
-
 #[contract]
 struct SecureBank;
 
