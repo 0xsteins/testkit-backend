@@ -556,6 +556,12 @@ fn audit_json_round_trips_control_characters_in_findings() {
         report["findings"][0]["severity"],
         "custom\t\n\r\u{1b}\"\\雪"
     );
+    // The snippet quoted from the file body carries no control sequences of
+    // its own, so it round-trips verbatim even though the file path does not.
+    assert_eq!(
+        report["findings"][0]["source_snippet"],
+        "    pub fn withdraw(env: Env, from: Address) {"
+    );
     assert_eq!(report["summary"]["finding_count"], 1);
     assert!(String::from_utf8_lossy(&output.stderr).contains("1 audit finding(s)"));
 }
@@ -799,4 +805,195 @@ fn audit_stdin_discovers_config_from_the_current_workspace() {
     assert!(output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["summary"]["finding_count"], 0);
+}
+
+// ---- #481: focused fixtures, one per supported Rust syntax form ----
+
+/// Every syntactic shape the audit visitor supports, in its own file so a
+/// per-file assertion points at the exact form. Except for the test fixture,
+/// every function takes an Address parameter and never calls require_auth,
+/// so each trips `missing-require-auth` and only that rule.
+const SYNTAX_FORM_FIXTURES: &[(&str, &str)] = &[
+    (
+        "form_free_item_fn.rs",
+        "pub fn withdraw(env: Env, from: Address) { let _ = &from; }",
+    ),
+    (
+        "form_const_item_fn.rs",
+        "pub const fn withdraw(env: Env, from: Address) { let _ = &from; }",
+    ),
+    (
+        "form_impl_method.rs",
+        "impl Vault { pub fn withdraw(env: Env, from: Address) { let _ = &from; } }",
+    ),
+    (
+        "form_contractimpl_method.rs",
+        "#[contractimpl] impl Vault { pub fn withdraw(env: Env, from: Address) { let _ = &from; } }",
+    ),
+    (
+        "form_trait_impl_method.rs",
+        "trait Vault { fn withdraw(env: Env, from: Address); } impl Vault for Vault2 { pub fn withdraw(env: Env, from: Address) { let _ = &from; } }",
+    ),
+    (
+        "form_nested_module_fn.rs",
+        "mod treasury { pub fn withdraw(env: Env, from: Address) { let _ = &from; } }",
+    ),
+    (
+        "form_test_item_fn.rs",
+        "#[test] fn test_reset_all_auths(env: Env) { env.mock_all_auths(); }",
+    ),
+];
+
+#[test]
+fn audit_reports_a_finding_for_each_supported_syntax_form() {
+    let fixture = AuditFixture::new("syntax-forms");
+    for (name, source) in SYNTAX_FORM_FIXTURES {
+        fixture.write(name, source);
+    }
+
+    let output = fixture.scan(&["--strict"]);
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(
+        report["summary"]["finding_count"],
+        SYNTAX_FORM_FIXTURES.len(),
+        "{findings:?}"
+    );
+
+    for (name, source) in SYNTAX_FORM_FIXTURES {
+        let expected_rule = if name.contains("test") {
+            "broad-mock-all-auths"
+        } else {
+            "missing-require-auth"
+        };
+        let matching: Vec<_> = findings
+            .iter()
+            .filter(|finding| {
+                finding["file"]
+                    .as_str()
+                    .is_some_and(|file| file.ends_with(name))
+            })
+            .collect();
+        assert_eq!(matching.len(), 1, "fixture {name}: {findings:?}");
+        let finding = matching[0];
+        assert_eq!(finding["rule"], expected_rule, "fixture {name}");
+        assert_eq!(finding["severity"], "warning", "fixture {name}");
+        assert_eq!(finding["line"], 1, "fixture {name}");
+        // Every fixture is a single physical line, so the reported snippet is
+        // the fixture text itself.
+        assert_eq!(finding["source_snippet"], *source, "fixture {name}");
+    }
+}
+
+// ---- #482: findings disclose that they are heuristic, not definitive ----
+
+#[test]
+fn audit_explain_rules_document_the_heuristic_nature_of_findings() {
+    for rule in [
+        "missing-require-auth",
+        "unchecked-i128-arithmetic",
+        "missing-ttl-bump",
+        "broad-mock-all-auths",
+        "ignored-token-transfer-result",
+        "missing-positive-amount-validation",
+        "unchecked-timestamp-arithmetic",
+    ] {
+        let output = run(&["audit", "explain", rule]);
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(rule), "{stdout}");
+        assert!(stdout.contains("heuristic"), "{stdout}");
+        assert!(stdout.contains("not a definitive defect report"), "{stdout}");
+    }
+}
+
+#[test]
+fn audit_rules_listing_documents_the_heuristic_nature_of_findings() {
+    let text = run(&["audit", "rules", "--format", "text"]);
+    assert!(text.status.success());
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(stdout.contains("missing-require-auth"), "{stdout}");
+    assert!(stdout.contains("note: heuristic"), "{stdout}");
+
+    let json = run(&["audit", "rules", "--format", "json"]);
+    assert!(json.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let limitations = report["summary"]["limitations"].as_array().unwrap();
+    assert!(
+        limitations
+            .iter()
+            .any(|l| l.as_str().unwrap().contains("heuristic")),
+        "{limitations:?}"
+    );
+}
+
+// ---- #483: rule severity mapping is consistent across output formats ----
+
+#[test]
+fn audit_sarif_levels_match_the_severity_shown_in_text_and_json() {
+    let fixture = AuditFixture::new("severity-consistency");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    for (configured, sarif_level) in [("warning", "warning"), ("error", "error"), ("note", "note")] {
+        fixture.write(
+            ".soroban-testkit.toml",
+            format!("[rules.missing-require-auth]\nseverity = '{configured}'\n"),
+        );
+        let text = fixture.scan(&["--format", "text"]);
+        assert!(text.status.success());
+        let stdout = String::from_utf8_lossy(&text.stdout);
+        assert!(stdout.contains(&format!("[{configured}]")), "{stdout}");
+
+        let json = fixture.scan(&["--format", "json"]);
+        assert!(json.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+        assert_eq!(report["findings"][0]["severity"], configured, "{report}");
+
+        let sarif = fixture.scan(&["--format", "sarif"]);
+        assert!(sarif.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&sarif.stdout).unwrap();
+        assert_eq!(report["runs"][0]["results"][0]["level"], sarif_level, "{report}");
+        assert_eq!(
+            report["runs"][0]["tool"]["driver"]["rules"][0]["defaultConfiguration"]["level"],
+            sarif_level,
+            "{report}"
+        );
+    }
+}
+
+// ---- #484: source snippets without terminal control sequences ----
+
+#[test]
+fn audit_reports_source_snippets_without_leaking_terminal_control_sequences() {
+    let fixture = AuditFixture::new("snippet-controls");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        "pub fn withdraw(env: Env, from: Address) { let _ = &from; } // \u{1b}[31mred\u{1b}[0m",
+    );
+
+    let text = fixture.scan(&["--format", "text"]);
+    assert!(text.status.success());
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        stdout.contains("    --> pub fn withdraw(env: Env, from: Address) { let _ = &from; } // red"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains('\u{1b}'), "{stdout}");
+
+    let json = fixture.scan(&["--format", "json"]);
+    assert!(json.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(
+        report["findings"][0]["source_snippet"],
+        "pub fn withdraw(env: Env, from: Address) { let _ = &from; } // red"
+    );
+
+    let sarif = fixture.scan(&["--format", "sarif"]);
+    assert!(sarif.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&sarif.stdout).unwrap();
+    assert_eq!(
+        report["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"]["snippet"]
+            ["text"],
+        "pub fn withdraw(env: Env, from: Address) { let _ = &from; } // red"
+    );
 }
