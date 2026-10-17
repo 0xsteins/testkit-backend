@@ -101,6 +101,14 @@ section, so a merge can never land without a place to record the change.
 
 ### Fixed
 
+- Keep `audit` findings and baseline paths relative to the workspace, and
+  discover rule configuration consistently for directories, files, and stdin
+  (#428). Continue scanning readable files after source or traversal errors,
+  while returning a non-zero status for incomplete scans (#425). Distinguish
+  Rust, TOML, and JSON parse diagnostics from file-access errors and include
+  the affected path and available source location (#426). Guard JSON escaping
+  of control characters in paths and diagnostic fields with regression
+  coverage (#424).
 - `TestEnv::at` now enters its scope with a coherent ledger position: the
   sequence number is derived from the scoped timestamp and the environment's
   ledger close interval (saturating at the ends of the range) instead of

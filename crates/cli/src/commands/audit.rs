@@ -35,6 +35,11 @@ pub struct AuditArgs {
     /// (its name begins with `.`, e.g. `.git/`, `.github/`, `.cargo/`). A
     /// missing path is reported as an actionable error rather than an empty
     /// "no findings" result.
+    /// Findings and baseline entries use workspace-relative paths. Config is
+    /// discovered from the source directory up to the workspace root (or
+    /// from the current directory for stdin). Files that cannot be read or
+    /// parsed are reported on stderr; other files are scanned, then the
+    /// command exits non-zero to indicate an incomplete audit.
     ///
     /// This static scan does not expand procedural macros or macro_rules!
     /// invocations. Inspect generated code separately (e.g. cargo expand).
@@ -46,7 +51,8 @@ pub struct AuditArgs {
     /// Output format. JSON and SARIF are intended for automation and code scanning.
     #[arg(long, value_enum, default_value_t = AuditOutputFormat::Text, global = true)]
     format: AuditOutputFormat,
-    /// Path to a baseline file containing findings to ignore.
+    /// Path to a baseline file containing findings to ignore, relative to
+    /// the current directory. Paths inside it are relative to the workspace.
     #[arg(long, global = true)]
     baseline: Option<PathBuf>,
 }
@@ -154,31 +160,77 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         None => {}
     }
 
-    let config = load_config(&args.path)?;
-    let baseline = load_baseline(&args.baseline)?;
+    let stdin = args.path == Path::new("-");
+    let mut scan_errors = Vec::new();
+    let sources = if stdin {
+        Vec::new()
+    } else {
+        collect_rust_sources(&args.path, &mut scan_errors)?
+    };
+    let source_dir = if stdin {
+        std::env::current_dir()?
+    } else {
+        let root = fs::canonicalize(&args.path).map_err(|err| {
+            CliError(format!(
+                "failed to resolve scan path {}: {err}",
+                args.path.display()
+            ))
+        })?;
+        if root.is_dir() {
+            root
+        } else {
+            root.parent().unwrap_or(&root).to_path_buf()
+        }
+    };
+    let workspace = find_workspace_root(&source_dir);
+    let config = load_config(&source_dir, &workspace)?;
+    let mut baseline = load_baseline(&args.baseline)?;
+    for entry in &mut baseline {
+        entry.file = workspace_relative_path(&workspace.join(&entry.file), &workspace)
+            .to_string_lossy()
+            .into_owned();
+    }
     let mut findings = Vec::new();
 
-    if args.path == Path::new("-") {
+    if stdin {
         let mut source = String::new();
         std::io::stdin()
             .read_to_string(&mut source)
             .map_err(|err| CliError(format!("failed to read stdin: {err}")))?;
-        audit_source(
+        if let Err(err) = audit_source(
             Path::new("<stdin>"),
             &source,
             &mut findings,
             &config,
             &source,
-        )?;
+        ) {
+            scan_errors.push(err);
+        }
     } else {
-        for path in collect_rust_sources(&args.path)? {
-            audit_file(&path, &mut findings, &config)?;
+        for path in sources {
+            if let Err(err) = audit_file(&path, &mut findings, &config) {
+                scan_errors.push(err);
+            }
+        }
+        for finding in &mut findings {
+            finding.file = workspace_relative_path(&finding.file, &workspace);
         }
     }
 
     findings.retain(|f| !baseline.iter().any(|b| f.matches_baseline(b)));
 
     print!("{}", render_findings(&findings, args.format)?);
+
+    if !scan_errors.is_empty() {
+        for error in &scan_errors {
+            eprintln!("audit: {error}");
+        }
+        return Err(CliError(format!(
+            "audit incomplete: {} scan error(s); findings cover only successfully parsed files; \
+             fix the reported paths and re-run",
+            scan_errors.len()
+        )));
+    }
 
     if args.strict && !findings.is_empty() {
         return Err(CliError(format!(
@@ -222,14 +274,21 @@ fn is_scannable_entry(entry: &walkdir::DirEntry) -> bool {
 /// A root that does not exist is an error, not an empty scan: silently
 /// reporting "no findings" for a typo'd path would be worse than useless in
 /// CI, so the message names every supported input form.
-fn collect_rust_sources(root: &Path) -> Result<Vec<PathBuf>, CliError> {
-    if !root.exists() {
-        return Err(CliError(format!(
-            "path {} does not exist; pass a contract crate directory, a single .rs file, \
-             or `-` to read Rust source from stdin",
-            root.display()
-        )));
-    }
+fn collect_rust_sources(root: &Path, errors: &mut Vec<CliError>) -> Result<Vec<PathBuf>, CliError> {
+    fs::metadata(root).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            CliError(format!(
+                "path {} does not exist; pass a contract crate directory, a single .rs file, \
+                 or `-` to read Rust source from stdin",
+                root.display()
+            ))
+        } else {
+            CliError(format!(
+                "failed to access scan path {}: {err}; check path permissions and re-run",
+                root.display()
+            ))
+        }
+    })?;
 
     let mut sources = Vec::new();
     for entry in WalkDir::new(root)
@@ -237,17 +296,22 @@ fn collect_rust_sources(root: &Path) -> Result<Vec<PathBuf>, CliError> {
         .into_iter()
         .filter_entry(is_scannable_entry)
     {
-        let entry = entry.map_err(|err| {
-            CliError(format!(
-                "failed to scan {}: {err}; check that the path is readable and re-run",
-                root.display()
-            ))
-        })?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                errors.push(CliError(format!(
+                    "failed to scan directory {}: {err}; check path permissions and re-run",
+                    err.path().unwrap_or(root).display()
+                )));
+                continue;
+            }
+        };
         let is_rust = entry.path().extension().is_some_and(|ext| ext == "rs");
         if entry.file_type().is_file() && is_rust {
             sources.push(entry.path().to_path_buf());
         }
     }
+    sources.sort();
     Ok(sources)
 }
 
@@ -519,6 +583,37 @@ pub fn render_sarif(findings: &[Finding]) -> Result<String, CliError> {
     DiagnosticRenderer::new(findings).render_sarif()
 }
 
+// Prefer a Cargo workspace, then a repository root, then the nearest crate.
+// Do not cross a repository boundary to discover another project's config.
+fn find_workspace_root(source_dir: &Path) -> PathBuf {
+    let mut crate_root = None;
+    for dir in source_dir.ancestors() {
+        if let Ok(manifest) = fs::read_to_string(dir.join("Cargo.toml")) {
+            if crate_root.is_none() {
+                crate_root = Some(dir.to_path_buf());
+            }
+            if let Ok(manifest) = toml::from_str::<toml::Value>(&manifest) {
+                if manifest.get("workspace").is_some() {
+                    return dir.to_path_buf();
+                }
+            }
+        }
+        if dir.join(".git").exists() {
+            return dir.to_path_buf();
+        }
+    }
+    crate_root.unwrap_or_else(|| source_dir.to_path_buf())
+}
+
+fn workspace_relative_path(path: &Path, workspace: &Path) -> PathBuf {
+    let absolute = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    absolute
+        .strip_prefix(workspace)
+        .unwrap_or(&absolute)
+        .components()
+        .collect()
+}
+
 /// Extract the source line and TOML table/key from a deserialization error.
 /// If the parser cannot identify a key (e.g. an unterminated table), the
 /// source line is still helpful alongside the path and parser diagnostic.
@@ -557,24 +652,30 @@ fn config_error_context(content: &str, err: &toml::de::Error) -> String {
     }
 }
 
-fn load_config(root: &Path) -> Result<AuditConfig, CliError> {
-    let config_paths = [
-        root.join(".soroban-testkit.toml"),
-        root.join("soroban-testkit.toml"),
-    ];
-
-    for path in &config_paths {
-        if path.exists() {
-            let content = std::fs::read_to_string(path)
-                .map_err(|err| CliError(format!("failed to read {}: {err}", path.display())))?;
-            let config = toml::from_str(&content).map_err(|err| {
+fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliError> {
+    for dir in source_dir.ancestors() {
+        for name in [".soroban-testkit.toml", "soroban-testkit.toml"] {
+            let path = dir.join(name);
+            let content = match fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(CliError(format!(
+                        "failed to read audit config {}: {err}; check file permissions and UTF-8 encoding",
+                        path.display()
+                    )));
+                }
+            };
+            return toml::from_str(&content).map_err(|err| {
                 CliError(format!(
-                    "failed to parse {}{}: {err}",
+                    "failed to parse audit config {}{} as TOML: {err}; fix the configuration syntax",
                     path.display(),
                     config_error_context(&content, &err)
                 ))
-            })?;
-            return Ok(config);
+            });
+        }
+        if dir == workspace {
+            break;
         }
     }
 
@@ -585,9 +686,9 @@ fn load_baseline(baseline_path: &Option<PathBuf>) -> Result<Vec<BaselineEntry>, 
     match baseline_path {
         Some(path) => {
             let content = fs::read_to_string(path)
-                .map_err(|err| CliError(format!("failed to read baseline file: {err}")))?;
+                .map_err(|err| CliError(format!("failed to read baseline file {}: {err}; check the path, permissions and UTF-8 encoding", path.display())))?;
             let entries: Vec<BaselineEntry> = serde_json::from_str(&content)
-                .map_err(|err| CliError(format!("failed to parse baseline JSON: {err}")))?;
+                .map_err(|err| CliError(format!("failed to parse baseline JSON {}: {err}; expected an array of file, line and rule entries", path.display())))?;
             Ok(entries)
         }
         None => Ok(Vec::new()),
@@ -599,8 +700,12 @@ fn audit_file(
     findings: &mut Vec<Finding>,
     config: &AuditConfig,
 ) -> Result<(), CliError> {
-    let src = std::fs::read_to_string(path)
-        .map_err(|err| CliError(format!("failed to read {}: {err}", path.display())))?;
+    let src = std::fs::read_to_string(path).map_err(|err| {
+        CliError(format!(
+            "failed to read Rust source {}: {err}; check file permissions and UTF-8 encoding",
+            path.display()
+        ))
+    })?;
     audit_source(path, &src, findings, config, &src)
 }
 
@@ -611,10 +716,15 @@ fn audit_source(
     config: &AuditConfig,
     full_src: &str,
 ) -> Result<(), CliError> {
-    let file = match syn::parse_file(src) {
-        Ok(file) => file,
-        Err(_) => return Ok(()), // Not every .rs file under a crate root need parse standalone.
-    };
+    let file = syn::parse_file(src).map_err(|err| {
+        let start = err.span().start();
+        CliError(format!(
+            "failed to parse Rust source {}:{}:{}: {err}; expected a complete Rust source file",
+            path.display(),
+            start.line,
+            start.column + 1
+        ))
+    })?;
 
     let suppressions = extract_suppressions(full_src);
 
@@ -1555,6 +1665,28 @@ mod tests {
     }
 
     #[test]
+    fn json_findings_escape_every_control_character_without_double_escaping() {
+        let controls: String = (0..=0x1f).map(char::from).collect();
+        let value = format!("{controls}\"\\雪 literal \\n and \\u0000");
+        let findings = [Finding {
+            file: PathBuf::from(&value),
+            line: 1,
+            rule: "missing-require-auth",
+            severity: value.clone(),
+            message: value.clone(),
+        }];
+        let output = render_findings(&findings, AuditOutputFormat::Json).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&output).unwrap();
+        for field in ["file", "severity", "message"] {
+            assert_eq!(report["findings"][0][field], value);
+        }
+        assert!(!output.chars().any(|c| c < ' ' && c != '\n'));
+        assert!(output.contains("\\u0000"));
+        assert!(output.contains("\\t"));
+        assert!(output.contains("\\r"));
+    }
+
+    #[test]
     fn sarif_output_contains_code_scanning_location() {
         let findings = audit_source_for_test("pub fn deposit(amount: i128) { save(amount); }");
         let output = render_findings(&findings, AuditOutputFormat::Sarif).unwrap();
@@ -1586,7 +1718,7 @@ mod tests {
         std::fs::write(root.join("node_modules/pkg/dep.rs"), "pub fn c() {}").unwrap();
         std::fs::write(root.join(".git/objects/blob.rs"), "pub fn d() {}").unwrap();
 
-        let sources = collect_rust_sources(&root).unwrap();
+        let sources = collect_rust_sources(&root, &mut Vec::new()).unwrap();
         assert_eq!(sources, vec![root.join("src/lib.rs")]);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1600,7 +1732,7 @@ mod tests {
         let file = root.join("only.rs");
         std::fs::write(&file, "pub fn a() {}").unwrap();
 
-        let sources = collect_rust_sources(&file).unwrap();
+        let sources = collect_rust_sources(&file, &mut Vec::new()).unwrap();
         assert_eq!(sources, vec![file]);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1609,7 +1741,7 @@ mod tests {
     #[test]
     fn collect_rust_sources_reports_a_missing_root_actionably() {
         let missing = std::env::temp_dir().join("stk-audit-root-that-does-not-exist-anywhere");
-        let err = collect_rust_sources(&missing).unwrap_err();
+        let err = collect_rust_sources(&missing, &mut Vec::new()).unwrap_err();
         assert!(err.0.contains("does not exist"), "{}", err.0);
         assert!(err.0.contains("stdin"), "{}", err.0);
     }
