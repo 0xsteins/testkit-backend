@@ -159,6 +159,7 @@ fn default_enabled() -> bool {
 pub struct Finding {
     pub file: PathBuf,
     pub line: usize,
+    pub column: usize,
     pub rule: &'static str,
     pub severity: String,
     pub message: String,
@@ -813,8 +814,11 @@ fn audit_source(
         config,
         suppressions: &suppressions,
         source: &source_lines,
+        current_column: 1,
     };
     visitor.visit_file(&file);
+    findings.sort_by(|left, right| left.file.cmp(&right.file).then(left.line.cmp(&right.line)).then(left.column.cmp(&right.column)).then(left.rule.cmp(right.rule)));
+    findings.dedup_by(|left, right| left.file == right.file && left.line == right.line && left.column == right.column && left.rule == right.rule);
     Ok(())
 }
 
@@ -834,6 +838,10 @@ impl SourceLines {
     /// past the end of the file.
     pub fn get(&self, line: usize) -> Option<&String> {
         self.0.get(line.checked_sub(1)?)
+    }
+
+    fn column(&self, line: usize, byte_column: usize) -> usize {
+        self.get(line).map(|source| source[..byte_column.min(source.len())].chars().count() + 1).unwrap_or(1)
     }
 }
 
@@ -885,28 +893,31 @@ struct FunctionVisitor<'a> {
     config: &'a AuditConfig,
     suppressions: &'a [Suppression],
     source: &'a SourceLines,
+    current_column: usize,
 }
 
 impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
-        let line = line_of(node);
+        let (line, column) = position_of(node, self.source);
+        self.current_column = column;
         let fn_name = node.sig.ident.to_string();
         let body_src = normalized_tokens(node.to_token_stream()).to_string();
-        self.audit_function(&node.sig, body_src.clone(), line);
+        self.audit_function(&node.sig, &node.block, body_src.clone(), line);
         self.audit_i128_arithmetic(&node.sig, &node.block, line);
         self.audit_ignored_transfer_results(&node.sig, &node.block);
-        self.audit_mock_all_auths(&body_src, line, &fn_name);
+        self.audit_mock_all_auths(&node.block, line, &fn_name);
         visit::visit_item_fn(self, node);
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
-        let line = line_of(node);
+        let (line, column) = position_of(node, self.source);
+        self.current_column = column;
         let fn_name = node.sig.ident.to_string();
         let body_src = normalized_tokens(node.to_token_stream()).to_string();
-        self.audit_function(&node.sig, body_src.clone(), line);
+        self.audit_function(&node.sig, &node.block, body_src.clone(), line);
         self.audit_i128_arithmetic(&node.sig, &node.block, line);
         self.audit_ignored_transfer_results(&node.sig, &node.block);
-        self.audit_mock_all_auths(&body_src, line, &fn_name);
+        self.audit_mock_all_auths(&node.block, line, &fn_name);
         visit::visit_impl_item_fn(self, node);
     }
 }
@@ -930,13 +941,13 @@ fn normalized_tokens(tokens: TokenStream) -> TokenStream {
 }
 
 impl FunctionVisitor<'_> {
-    fn audit_function(&mut self, sig: &Signature, body_src: String, line: usize) {
+    fn audit_function(&mut self, sig: &Signature, block: &syn::Block, body_src: String, line: usize) {
         let name = sig.ident.to_string();
 
         // Rule 1: an Address parameter that's never checked with require_auth.
         if self.is_enabled("missing-require-auth") {
             let address_params = address_typed_params(sig);
-            if !address_params.is_empty() && !body_src.contains("require_auth") {
+            if !address_params.is_empty() && !contains_method_call(block, "require_auth") {
                 self.push(
                     line,
                     "missing-require-auth",
@@ -1011,17 +1022,17 @@ impl FunctionVisitor<'_> {
         }
     }
 
-    fn audit_mock_all_auths(&mut self, body_src: &str, line: usize, fn_name: &str) {
+    fn audit_mock_all_auths(&mut self, block: &syn::Block, line: usize, fn_name: &str) {
         if !self.is_enabled("broad-mock-all-auths") {
             return;
         }
 
-        let is_test = fn_name.contains("test") || body_src.contains("#[test]");
+        let is_test = fn_name.contains("test");
         if !is_test {
             return;
         }
 
-        if body_src.contains("mock_all_auths") {
+        if contains_method_call(block, "mock_all_auths") {
             self.push(
                 line,
                 "broad-mock-all-auths",
@@ -1078,6 +1089,7 @@ impl FunctionVisitor<'_> {
         self.findings.push(Finding {
             file: self.path.clone(),
             line,
+            column: self.current_column,
             rule,
             severity: severity.to_string(),
             message,
@@ -1203,12 +1215,28 @@ fn type_is_address(ty: &Type) -> bool {
     }
 }
 
-fn line_of(node: impl quote::ToTokens) -> usize {
+fn position_of(node: impl quote::ToTokens, source: &SourceLines) -> (usize, usize) {
     node.to_token_stream()
         .into_iter()
         .next()
-        .map(|t| t.span().start().line)
-        .unwrap_or(0)
+        .map(|token| {
+            let start = token.span().start();
+            (start.line, source.column(start.line, start.column))
+        })
+        .unwrap_or((0, 1))
+}
+
+fn contains_method_call(block: &syn::Block, method: &str) -> bool {
+    struct MethodCallVisitor<'a> { method: &'a str, found: bool }
+    impl<'ast> Visit<'ast> for MethodCallVisitor<'_> {
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            if node.method == self.method { self.found = true; }
+            visit::visit_expr_method_call(self, node);
+        }
+    }
+    let mut visitor = MethodCallVisitor { method, found: false };
+    visitor.visit_block(block);
+    visitor.found
 }
 
 struct IgnoredTransferVisitor<'a> {
@@ -1218,6 +1246,7 @@ struct IgnoredTransferVisitor<'a> {
     config: &'a AuditConfig,
     suppressions: &'a [Suppression],
     source: &'a SourceLines,
+    current_column: usize,
 }
 
 impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
@@ -1237,7 +1266,7 @@ impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
         };
 
         if let Some(expr) = ignored_call {
-            let line = line_of(expr);
+            let (line, column) = position_of(expr, self.source);
             let is_suppressed = self.suppressions.iter().any(|s| {
                 (s.line == line || s.line == line - 1)
                     && (s.rules.contains(&"*".to_string())
@@ -1308,11 +1337,13 @@ struct I128ArithmeticVisitor<'a> {
     path: PathBuf,
     fn_name: String,
     fn_line: usize,
+    fn_column: usize,
     i128_bindings: HashSet<String>,
     findings: &'a mut Vec<Finding>,
     config: &'a AuditConfig,
     suppressions: &'a [Suppression],
     source: &'a SourceLines,
+    current_column: usize,
 }
 
 impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
@@ -1350,6 +1381,7 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
                 self.findings.push(Finding {
                     file: self.path.clone(),
                     line: self.fn_line,
+                    column: self.fn_column,
                     rule: "unchecked-i128-arithmetic",
                     severity: severity.to_string(),
                     message: format!(
@@ -1695,6 +1727,7 @@ mod tests {
         let findings = [Finding {
             file: PathBuf::from(&value),
             line: 1,
+            column: 1,
             rule: "missing-require-auth",
             severity: value.clone(),
             message: value.clone(),
