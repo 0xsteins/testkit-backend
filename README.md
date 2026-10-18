@@ -145,7 +145,10 @@ comment-only Rust files are valid inputs with no findings. Raw identifiers
 such as `r#amount` are checked the same way as their ordinary spellings.
 
 Findings use paths relative to the Cargo workspace root (or the repository
-root or crate root when there is no workspace). The nearest
+root or crate root when there is no workspace). Every path the command
+compares or prints is normalized first — symlinks and `.`/`..` components
+resolved — so one file always reports under a single spelling however its
+scan root was spelled on the command line. The nearest
 `.soroban-testkit.toml` or `soroban-testkit.toml` between the scanned source
 directory and that root supplies rule configuration; the dotted name takes
 precedence in the same directory. Single-file scans start config discovery

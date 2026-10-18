@@ -1000,3 +1000,29 @@ fn audit_reports_source_snippets_without_leaking_terminal_control_sequences() {
         "pub fn withdraw(env: Env, from: Address) { let _ = &from; } // red"
     );
 }
+
+// ---- #488: one canonical path normalization routine ----
+
+#[test]
+fn audit_normalizes_equivalent_spellings_of_one_scan_root() {
+    let fixture = AuditFixture::new("canonical-roots");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let mut reports = Vec::new();
+    for root in [
+        "crates/vault/src/lib.rs",
+        "./crates/vault/./src/../src/lib.rs",
+        "crates/vault/src/../../vault/src/lib.rs",
+    ] {
+        let output = run_from(&fixture.0, &["audit", root, "--format", "json"]);
+        assert!(output.status.success(), "root {root}: {output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["findings"][0]["file"], "crates/vault/src/lib.rs",
+            "root {root}: {report}"
+        );
+        reports.push(report);
+    }
+    assert_eq!(reports[0], reports[1]);
+    assert_eq!(reports[1], reports[2]);
+}

@@ -98,6 +98,11 @@ pub struct AuditArgs {
     ///
     /// This static scan does not expand procedural macros or macro_rules!
     /// invocations. Inspect generated code separately (e.g. cargo expand).
+    ///
+    /// Every path the command compares or prints is normalized through one
+    /// canonical routine first (symlinks and `.`/`..` components resolved),
+    /// so one file always reports under a single workspace-relative
+    /// spelling no matter how it was spelled on the command line.
     #[arg(value_name = "PATH", default_value = ".", global = true)]
     path: PathBuf,
     /// Exit non-zero if any findings are reported.
@@ -237,14 +242,9 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         collect_rust_sources(&args.path, &mut scan_errors)?
     };
     let source_dir = if stdin {
-        std::env::current_dir()?
+        canonical_path(&std::env::current_dir()?)?
     } else {
-        let root = fs::canonicalize(&args.path).map_err(|err| {
-            CliError(format!(
-                "failed to resolve scan path {}: {err}",
-                args.path.display()
-            ))
-        })?;
+        let root = canonical_path(&args.path)?;
         if root.is_dir() {
             root
         } else {
@@ -701,6 +701,23 @@ pub fn render_sarif(findings: &[Finding]) -> Result<String, CliError> {
     DiagnosticRenderer::new(findings).render_sarif()
 }
 
+/// The one canonical path normalization routine for `audit`. The path is
+/// resolved through the operating system (symlinks, `.` and `..` components,
+/// redundant separators) and rebuilt from its components, so every spelling
+/// of one file normalizes to a single value. The scan root, the stdin start
+/// directory, finding paths, and baseline entries all normalize here, and a
+/// failure carries actionable context for the caller to surface.
+fn canonical_path(path: &Path) -> Result<PathBuf, CliError> {
+    fs::canonicalize(path)
+        .map(|resolved| resolved.components().collect())
+        .map_err(|err| {
+            CliError(format!(
+                "failed to resolve path {}: {err}; verify the path exists and is readable",
+                path.display()
+            ))
+        })
+}
+
 // Prefer a Cargo workspace, then a repository root, then the nearest crate.
 // Do not cross a repository boundary to discover another project's config.
 fn find_workspace_root(source_dir: &Path) -> PathBuf {
@@ -724,7 +741,7 @@ fn find_workspace_root(source_dir: &Path) -> PathBuf {
 }
 
 fn workspace_relative_path(path: &Path, workspace: &Path) -> PathBuf {
-    let absolute = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let absolute = canonical_path(path).unwrap_or_else(|_| path.to_path_buf());
     absolute
         .strip_prefix(workspace)
         .unwrap_or(&absolute)
@@ -1943,5 +1960,89 @@ mod tests {
         {
             assert_eq!(finding.source_snippet.as_deref(), Some(source));
         }
+    }
+
+    // ---- #488: one canonical path normalization routine ----
+
+    #[test]
+    fn canonical_path_maps_equivalent_spellings_to_one_value() {
+        let root = std::env::temp_dir().join(format!("stk-audit-canonical-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+
+        let expected = fs::canonicalize(root.join("src/lib.rs")).unwrap();
+        assert!(expected.is_absolute());
+        assert_eq!(canonical_path(&root.join("src/lib.rs")).unwrap(), expected);
+        assert_eq!(
+            canonical_path(&root.join("src/../src/lib.rs")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            canonical_path(&root.join("./src/./lib.rs")).unwrap(),
+            expected
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_path_follows_symlinks_before_comparing() {
+        let root = std::env::temp_dir().join(format!("stk-audit-symlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("real")).unwrap();
+        fs::write(root.join("real/lib.rs"), "").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+
+        assert_eq!(
+            canonical_path(&root.join("link/lib.rs")).unwrap(),
+            canonical_path(&root.join("real/lib.rs")).unwrap()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn canonical_path_failure_names_the_path_and_the_check_to_make() {
+        let missing = std::env::temp_dir()
+            .join(format!("stk-audit-canonical-missing-{}", std::process::id()))
+            .join("nope.rs");
+        let message = canonical_path(&missing).unwrap_err().0;
+        assert!(message.contains("failed to resolve path"), "{message}");
+        assert!(message.contains("nope.rs"), "{message}");
+        assert!(message.contains("verify the path exists"), "{message}");
+    }
+
+    #[test]
+    fn workspace_relative_path_normalizes_before_stripping_the_root() {
+        let root =
+            std::env::temp_dir().join(format!("stk-audit-ws-relative-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+        let workspace = fs::canonicalize(&root).unwrap();
+
+        assert_eq!(
+            workspace_relative_path(&workspace.join("src/../src/lib.rs"), &workspace),
+            PathBuf::from("src/lib.rs")
+        );
+        assert_eq!(
+            workspace_relative_path(&workspace.join("src/lib.rs"), &workspace),
+            PathBuf::from("src/lib.rs")
+        );
+
+        // A file outside the workspace keeps its full canonical path instead
+        // of a misleading stripped one.
+        let outside =
+            std::env::temp_dir().join(format!("stk-audit-outside-{}", std::process::id()));
+        fs::write(&outside, "").unwrap();
+        assert_eq!(
+            workspace_relative_path(&outside, &workspace),
+            fs::canonicalize(&outside).unwrap()
+        );
+
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&root);
     }
 }
