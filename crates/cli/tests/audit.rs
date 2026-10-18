@@ -1102,3 +1102,67 @@ fn audit_strict_failure_reports_findings_and_no_parse_warnings() {
     assert!(!stderr.contains("parse warning"), "{stderr}");
     assert!(!stderr.contains("audit: warning:"), "{stderr}");
 }
+
+// ---- #486: regression snapshots for strict and report-only modes ----
+
+/// The exact report both modes must print. `--strict` changes only the exit
+/// status and the error on stderr — never a byte of the report itself.
+const FINDINGS_REPORT_SNAPSHOT: &str = include_str!("snapshots/audit_findings_report.txt");
+const CLEAN_REPORT_SNAPSHOT: &str = include_str!("snapshots/audit_clean_report.txt");
+const STRICT_ERROR_SNAPSHOT: &str = include_str!("snapshots/audit_strict_error.txt");
+
+/// One physical line, exactly one finding: the source both mode snapshots
+/// scan, so the snapshot pins report shape rather than scan ordering.
+const SNAPSHOT_ENTRY_POINT: &str = "pub fn withdraw(env: Env, from: Address) { let _ = &from; }\n";
+
+#[test]
+fn audit_report_only_mode_matches_its_regression_snapshot() {
+    let fixture = AuditFixture::new("snapshot-report-only");
+    fixture.write("crates/vault/src/lib.rs", SNAPSHOT_ENTRY_POINT);
+
+    let output = fixture.scan(&["--format", "text"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        FINDINGS_REPORT_SNAPSHOT,
+        "report-only snapshot changed"
+    );
+}
+
+#[test]
+fn audit_strict_mode_matches_its_regression_snapshot() {
+    let fixture = AuditFixture::new("snapshot-strict");
+    fixture.write("crates/vault/src/lib.rs", SNAPSHOT_ENTRY_POINT);
+
+    let output = fixture.scan(&["--format", "text", "--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+    // Strict fails the run without changing a single byte of the report.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        FINDINGS_REPORT_SNAPSHOT,
+        "strict-mode report snapshot changed"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        STRICT_ERROR_SNAPSHOT,
+        "strict-mode error snapshot changed"
+    );
+}
+
+#[test]
+fn audit_clean_report_is_snapshotted_in_both_modes() {
+    let fixture = AuditFixture::new("snapshot-clean");
+    fixture.write("crates/vault/src/lib.rs", "// nothing to flag\n");
+    let modes: &[&[&str]] = &[&["--format", "text"], &["--format", "text", "--strict"]];
+    for args in modes {
+        let output = fixture.scan(args);
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            CLEAN_REPORT_SNAPSHOT,
+            "clean-report snapshot changed for {args:?}"
+        );
+    }
+}
