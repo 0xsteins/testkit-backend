@@ -100,14 +100,15 @@ pub struct AuditArgs {
     /// "no findings" result. Explicitly selecting an excluded directory or
     /// one of its files still scans that input. Empty Rust files are valid
     /// and produce no findings.
-    /// Findings and baseline entries use workspace-relative paths. Config is
-    /// discovered from the source directory up to the workspace root (or
-    /// from the current directory for stdin). Files that cannot be read or
-    /// parsed produce a *parse warning* on stderr — an input skipped, never
-    /// scanned — not a finding: warnings never appear in the report, never
-    /// count toward `finding_count`, and never trigger `--strict`. Other
-    /// files are scanned, then the command exits non-zero to indicate an
-    /// incomplete audit.
+    /// Findings and baseline entries use workspace-relative paths, and
+    /// findings are reported in one canonical order: file, then line, then
+    /// rule, then message. Config is discovered from the source directory
+    /// up to the workspace root (or from the current directory for stdin).
+    /// Files that cannot be read or parsed produce a *parse warning* on
+    /// stderr — an input skipped, never scanned — not a finding: warnings
+    /// never appear in the report, never count toward `finding_count`, and
+    /// never trigger `--strict`. Other files are scanned, then the command
+    /// exits non-zero to indicate an incomplete audit.
     ///
     /// This static scan does not expand procedural macros or macro_rules!
     /// invocations. Inspect generated code separately (e.g. cargo expand).
@@ -300,6 +301,9 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     }
 
     findings.retain(|f| !baseline.iter().any(|b| f.matches_baseline(b)));
+    // Paths are final now, so this is the ordering every rendered report
+    // is guaranteed to follow.
+    normalize_findings(&mut findings);
 
     print!("{}", render_findings(&findings, args.format)?);
 
@@ -812,6 +816,31 @@ fn load_baseline(baseline_path: &Option<PathBuf>) -> Result<Vec<BaselineEntry>, 
     }
 }
 
+/// The one canonical ordering for findings: file, then line, then rule,
+/// then message, with column breaking any remaining tie — and exact
+/// duplicates (same file, line, column, rule, and message) collapse. Every
+/// report path funnels through this routine, in `audit_source` per parsed
+/// file and again in `run` after paths are rewritten workspace-relative, so
+/// text, JSON and SARIF always list a finding in the same place regardless
+/// of scan order.
+fn normalize_findings(findings: &mut [Finding]) {
+    findings.sort_by(|left, right| {
+        left.file
+            .cmp(&right.file)
+            .then(left.line.cmp(&right.line))
+            .then(left.rule.cmp(right.rule))
+            .then(left.message.cmp(&right.message))
+            .then(left.column.cmp(&right.column))
+    });
+    findings.dedup_by(|left, right| {
+        left.file == right.file
+            && left.line == right.line
+            && left.column == right.column
+            && left.rule == right.rule
+            && left.message == right.message
+    });
+}
+
 fn audit_file(
     path: &Path,
     findings: &mut Vec<Finding>,
@@ -855,19 +884,7 @@ fn audit_source(
         current_column: 1,
     };
     visitor.visit_file(&file);
-    findings.sort_by(|left, right| {
-        left.file
-            .cmp(&right.file)
-            .then(left.line.cmp(&right.line))
-            .then(left.column.cmp(&right.column))
-            .then(left.rule.cmp(right.rule))
-    });
-    findings.dedup_by(|left, right| {
-        left.file == right.file
-            && left.line == right.line
-            && left.column == right.column
-            && left.rule == right.rule
-    });
+    normalize_findings(findings);
     Ok(())
 }
 
@@ -2065,5 +2082,86 @@ mod tests {
 
         let _ = fs::remove_file(&outside);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- #485: findings sort by file, line, rule, and message ----
+
+    fn sample_finding(file: &str, line: usize, rule: &'static str, message: &str) -> Finding {
+        Finding {
+            file: PathBuf::from(file),
+            line,
+            column: 1,
+            rule,
+            severity: "warning".to_string(),
+            message: message.to_string(),
+            source_snippet: None,
+        }
+    }
+
+    #[test]
+    fn normalize_findings_orders_by_file_line_rule_and_message() {
+        let mut findings = vec![
+            sample_finding("b.rs", 9, "missing-ttl-bump", "later file"),
+            sample_finding("a.rs", 9, "missing-require-auth", "second message"),
+            sample_finding("a.rs", 2, "missing-require-auth", "first line"),
+            sample_finding("a.rs", 9, "missing-require-auth", "another message"),
+            // The rule sorts before the message does, so a lexicographically
+            // later message still lands first when its rule is smaller.
+            sample_finding(
+                "a.rs",
+                9,
+                "missing-positive-amount-validation",
+                "z message",
+            ),
+        ];
+
+        normalize_findings(&mut findings);
+
+        let ordered: Vec<_> = findings
+            .iter()
+            .map(|f| (f.file.to_str().unwrap(), f.line, f.message.as_str()))
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                ("a.rs", 2, "first line"),
+                ("a.rs", 9, "z message"),
+                ("a.rs", 9, "another message"),
+                ("a.rs", 9, "second message"),
+                ("b.rs", 9, "later file"),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_findings_collapses_only_exact_duplicates() {
+        let mut findings = vec![
+            sample_finding(
+                "a.rs",
+                1,
+                "missing-positive-amount-validation",
+                "fn f takes `amount1`",
+            ),
+            sample_finding(
+                "a.rs",
+                1,
+                "missing-positive-amount-validation",
+                "fn f takes `amount2`",
+            ),
+            sample_finding(
+                "a.rs",
+                1,
+                "missing-positive-amount-validation",
+                "fn f takes `amount1`",
+            ),
+        ];
+
+        normalize_findings(&mut findings);
+
+        let messages: Vec<_> = findings.iter().map(|f| f.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            vec!["fn f takes `amount1`", "fn f takes `amount2`"]
+        );
     }
 }

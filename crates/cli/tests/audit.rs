@@ -1002,6 +1002,45 @@ fn audit_reports_source_snippets_without_leaking_terminal_control_sequences() {
     );
 }
 
+// ---- #485: findings sort by file, line, rule, and message ----
+
+#[test]
+fn audit_orders_findings_by_rule_rather_than_scan_order_or_column() {
+    let fixture = AuditFixture::new("finding-order");
+    // Both functions sit on one physical line: `alpha` starts at column 1
+    // and is visited first, but `missing-positive-amount-validation` sorts
+    // before `missing-require-auth`, so the report follows the rule — not
+    // the scan order or the column.
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        "pub fn alpha(env: Env, from: Address) { let _ = &from; } \
+         pub fn beta(amount: i128) { save(amount); }\n",
+    );
+
+    let first = fixture.scan(&["--strict"]);
+    assert!(!first.status.success(), "{first:?}");
+    let report: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 2, "{report}");
+    let rules: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| finding["rule"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        rules,
+        vec!["missing-positive-amount-validation", "missing-require-auth"],
+        "{report}"
+    );
+
+    // The order is deterministic across runs.
+    let second = fixture.scan(&["--strict"]);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&second.stdout).unwrap(),
+        report
+    );
+}
+
 // ---- #488: one canonical path normalization routine ----
 
 #[test]

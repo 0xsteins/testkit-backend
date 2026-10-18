@@ -148,11 +148,14 @@ Findings use paths relative to the Cargo workspace root (or the repository
 root or crate root when there is no workspace). Every path the command
 compares or prints is normalized first — symlinks and `.`/`..` components
 resolved — so one file always reports under a single spelling however its
-scan root was spelled on the command line. The nearest
-`.soroban-testkit.toml` or `soroban-testkit.toml` between the scanned source
-directory and that root supplies rule configuration; the dotted name takes
-precedence in the same directory. Single-file scans start config discovery
-at the file's parent, and stdin scans start at the current directory.
+scan root was spelled on the command line. Findings are then reported in
+one deterministic order — file, then line, then rule, then message — so a
+report diff always reflects a real change rather than scan order. The
+nearest `.soroban-testkit.toml` or `soroban-testkit.toml` between the
+scanned source directory and that root supplies rule configuration; the
+dotted name takes precedence in the same directory. Single-file scans start
+config discovery at the file's parent, and stdin scans start at the current
+directory.
 `--baseline baseline.json` resolves the baseline file from the current
 directory, while its `file` entries are workspace-relative, so one baseline
 works from member crates too. Absolute entries are also accepted.
