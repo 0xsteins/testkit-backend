@@ -192,20 +192,16 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
     cmd.stderr(Stdio::piped());
 
     let mut child = cmd.spawn().map_err(|err| match err.kind() {
-        std::io::ErrorKind::NotFound => CliError(
-            "cargo-llvm-cov is not installed or not found in PATH; \
-                     install it with: cargo install cargo-llvm-cov"
-                .to_string(),
-        ),
+        std::io::ErrorKind::NotFound => CliError(identify_missing_coverage_dependency()),
         _ => CliError(format!(
             "failed to run `cargo llvm-cov` ({err}); is cargo-llvm-cov installed? \
                  try `cargo install cargo-llvm-cov`"
         )),
     })?;
 
-    let output = child.wait_with_output().map_err(|err| {
-        CliError(format!("failed to wait for `cargo llvm-cov`: {err}"))
-    })?;
+    let output = child
+        .wait_with_output()
+        .map_err(|err| CliError(format!("failed to wait for `cargo llvm-cov`: {err}")))?;
 
     let captured_stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -610,7 +606,20 @@ pub(crate) fn is_metadata_error(cargo_stderr: &str) -> bool {
         "current package believes it's in a workspace when it's not",
     ];
     let lower = cargo_stderr.to_ascii_lowercase();
-    METADATA_PATTERNS.iter().any(|pat| lower.contains(&pat.to_ascii_lowercase()))
+    METADATA_PATTERNS
+        .iter()
+        .any(|pat| lower.contains(&pat.to_ascii_lowercase()))
+}
+
+fn identify_missing_coverage_dependency() -> String {
+    format!(
+        "cargo-llvm-cov is not installed or not found in PATH.\n\
+         This tool requires two components:\n\
+         1. The cargo-llvm-cov binary: install with `cargo install cargo-llvm-cov`\n\
+         2. LLVM tools for your toolchain: install with `rustup component add llvm-tools-preview`\n\
+         If you have installed cargo-llvm-cov, check that it is in your PATH or the Rust toolchain directory.\n\
+         For more help, see: https://github.com/taiki-e/cargo-llvm-cov#installation"
+    )
 }
 
 fn coverage_failure_message(
@@ -870,12 +879,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn output_path_with_spaces_in_name() {
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        a.output = Some(std::path::PathBuf::from("my output file.json"));
+        let cmd = build_command(&a).unwrap();
+        let rendered = rendered_args(&cmd);
+        assert!(
+            rendered.contains(&"my output file.json".to_string()),
+            "path with spaces should be preserved: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn output_dir_with_spaces_in_json() {
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        a.output_dir = Some(std::path::PathBuf::from("my coverage reports"));
+        let cmd = build_command(&a).unwrap();
+        let rendered = rendered_args(&cmd);
+        assert_eq!(
+            rendered,
+            vec![
+                "llvm-cov",
+                "test",
+                "--json",
+                "--output-path",
+                "my coverage reports/coverage.json",
+            ]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn signal_termination_is_reported_distinctly() {
         use std::os::unix::process::ExitStatusExt;
 
-        let message = coverage_failure_message(std::process::ExitStatus::from_raw(9), false, None, "");
+        let message =
+            coverage_failure_message(std::process::ExitStatus::from_raw(9), false, None, "");
         assert_eq!(message, "coverage run terminated by signal 9");
     }
 
@@ -1185,7 +1227,8 @@ mod tests {
         let status = std::process::ExitStatus::from_raw(256); // exit code 1
 
         // Metadata error: cargo cannot find Cargo.toml
-        let stderr_no_toml = "error: could not find `Cargo.toml` in `/tmp/empty` or any parent directory";
+        let stderr_no_toml =
+            "error: could not find `Cargo.toml` in `/tmp/empty` or any parent directory";
         let msg = coverage_failure_message(status, false, None, stderr_no_toml);
         assert!(
             msg.contains("cargo could not read project metadata"),
@@ -1206,7 +1249,8 @@ mod tests {
         );
 
         // Metadata error: invalid manifest
-        let stderr_bad_manifest = "error: failed to parse manifest at `/home/user/project/Cargo.toml`";
+        let stderr_bad_manifest =
+            "error: failed to parse manifest at `/home/user/project/Cargo.toml`";
         let msg2 = coverage_failure_message(status, false, None, stderr_bad_manifest);
         assert!(
             msg2.contains("cargo could not read project metadata"),
@@ -1228,11 +1272,19 @@ mod tests {
 
     #[test]
     fn is_metadata_error_detects_known_cargo_patterns() {
-        assert!(is_metadata_error("error: could not find `Cargo.toml` in `/tmp`"));
+        assert!(is_metadata_error(
+            "error: could not find `Cargo.toml` in `/tmp`"
+        ));
         assert!(is_metadata_error("error: could not find Cargo.toml"));
-        assert!(is_metadata_error("error: manifest path `/bad` does not exist"));
-        assert!(is_metadata_error("error: failed to parse manifest at `/project/Cargo.toml`"));
-        assert!(!is_metadata_error("error: some llvm-cov instrumentation failure"));
+        assert!(is_metadata_error(
+            "error: manifest path `/bad` does not exist"
+        ));
+        assert!(is_metadata_error(
+            "error: failed to parse manifest at `/project/Cargo.toml`"
+        ));
+        assert!(!is_metadata_error(
+            "error: some llvm-cov instrumentation failure"
+        ));
         assert!(!is_metadata_error("error: failed to compile test binary"));
         assert!(!is_metadata_error(""));
     }
@@ -1356,7 +1408,11 @@ mod tests {
         // Zero-line file must not appear in file_summaries or package_summaries.
         let parsed: serde_json::Value = serde_json::from_str(&augmented).unwrap();
         let files = parsed["file_summaries"].as_array().unwrap();
-        assert_eq!(files.len(), 1, "zero-line file must be excluded from file_summaries");
+        assert_eq!(
+            files.len(),
+            1,
+            "zero-line file must be excluded from file_summaries"
+        );
         assert_eq!(files[0]["filename"], "crates/testkit/src/lib.rs");
 
         // Totals must only reflect the one instrumented file.
@@ -1394,7 +1450,10 @@ mod tests {
         // With --exclude cli: only testkit lines are counted.
         let (augmented, summary_excl) =
             augment_coverage_json(raw_json, &["cli".to_string()]).unwrap();
-        assert_eq!(summary_excl.lines_total, 100, "excluded package lines must not inflate total");
+        assert_eq!(
+            summary_excl.lines_total, 100,
+            "excluded package lines must not inflate total"
+        );
         assert_eq!(summary_excl.lines_covered, 80);
         assert!(
             (summary_excl.line_percent - 80.0).abs() < 1e-4,
@@ -1405,11 +1464,19 @@ mod tests {
         // Excluded file must not appear in file_summaries.
         let parsed: serde_json::Value = serde_json::from_str(&augmented).unwrap();
         let files = parsed["file_summaries"].as_array().unwrap();
-        assert_eq!(files.len(), 1, "excluded package file must be absent from file_summaries");
+        assert_eq!(
+            files.len(),
+            1,
+            "excluded package file must be absent from file_summaries"
+        );
         assert_eq!(files[0]["filename"], "crates/testkit/src/lib.rs");
 
         let pkgs = parsed["package_summaries"].as_array().unwrap();
-        assert_eq!(pkgs.len(), 1, "excluded package must be absent from package_summaries");
+        assert_eq!(
+            pkgs.len(),
+            1,
+            "excluded package must be absent from package_summaries"
+        );
         assert_eq!(pkgs[0]["package_name"], "testkit");
     }
 
@@ -1465,8 +1532,7 @@ mod tests {
             }]
         }"#;
 
-        let (augmented, summary) =
-            augment_coverage_json(raw_json, &["audit".to_string()]).unwrap();
+        let (augmented, summary) = augment_coverage_json(raw_json, &["audit".to_string()]).unwrap();
 
         // Only testkit/lib.rs survives: cli/mod.rs is dropped (zero lines),
         // audit/lib.rs is dropped (excluded package).
