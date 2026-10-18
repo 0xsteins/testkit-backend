@@ -817,8 +817,19 @@ fn audit_source(
         current_column: 1,
     };
     visitor.visit_file(&file);
-    findings.sort_by(|left, right| left.file.cmp(&right.file).then(left.line.cmp(&right.line)).then(left.column.cmp(&right.column)).then(left.rule.cmp(right.rule)));
-    findings.dedup_by(|left, right| left.file == right.file && left.line == right.line && left.column == right.column && left.rule == right.rule);
+    findings.sort_by(|left, right| {
+        left.file
+            .cmp(&right.file)
+            .then(left.line.cmp(&right.line))
+            .then(left.column.cmp(&right.column))
+            .then(left.rule.cmp(right.rule))
+    });
+    findings.dedup_by(|left, right| {
+        left.file == right.file
+            && left.line == right.line
+            && left.column == right.column
+            && left.rule == right.rule
+    });
     Ok(())
 }
 
@@ -841,7 +852,9 @@ impl SourceLines {
     }
 
     fn column(&self, line: usize, byte_column: usize) -> usize {
-        self.get(line).map(|source| source[..byte_column.min(source.len())].chars().count() + 1).unwrap_or(1)
+        self.get(line).map_or(1, |source| {
+            source[..byte_column.min(source.len())].chars().count() + 1
+        })
     }
 }
 
@@ -941,7 +954,13 @@ fn normalized_tokens(tokens: TokenStream) -> TokenStream {
 }
 
 impl FunctionVisitor<'_> {
-    fn audit_function(&mut self, sig: &Signature, block: &syn::Block, body_src: String, line: usize) {
+    fn audit_function(
+        &mut self,
+        sig: &Signature,
+        block: &syn::Block,
+        body_src: String,
+        line: usize,
+    ) {
         let name = sig.ident.to_string();
 
         // Rule 1: an Address parameter that's never checked with require_auth.
@@ -1117,6 +1136,7 @@ impl FunctionVisitor<'_> {
             path: self.path.clone(),
             fn_name: sig.ident.to_string(),
             fn_line: line,
+            fn_column: self.current_column,
             i128_bindings,
             findings: self.findings,
             config: self.config,
@@ -1227,10 +1247,15 @@ fn position_of(node: impl quote::ToTokens, source: &SourceLines) -> (usize, usiz
 }
 
 fn contains_method_call(block: &syn::Block, method: &str) -> bool {
-    struct MethodCallVisitor<'a> { method: &'a str, found: bool }
+    struct MethodCallVisitor<'a> {
+        method: &'a str,
+        found: bool,
+    }
     impl<'ast> Visit<'ast> for MethodCallVisitor<'_> {
         fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-            if node.method == self.method { self.found = true; }
+            if node.method == self.method {
+                self.found = true;
+            }
             visit::visit_expr_method_call(self, node);
         }
     }
@@ -1246,7 +1271,6 @@ struct IgnoredTransferVisitor<'a> {
     config: &'a AuditConfig,
     suppressions: &'a [Suppression],
     source: &'a SourceLines,
-    current_column: usize,
 }
 
 impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
@@ -1285,6 +1309,7 @@ impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
                 self.findings.push(Finding {
                     file: self.path.clone(),
                     line,
+                    column,
                     rule: "ignored-token-transfer-result",
                     severity: severity.to_string(),
                     message: format!(
@@ -1343,7 +1368,6 @@ struct I128ArithmeticVisitor<'a> {
     config: &'a AuditConfig,
     suppressions: &'a [Suppression],
     source: &'a SourceLines,
-    current_column: usize,
 }
 
 impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
@@ -1447,6 +1471,7 @@ mod tests {
             config,
             suppressions: &suppressions,
             source: &source_lines,
+            current_column: 1,
         };
         visitor.visit_file(&file);
         findings

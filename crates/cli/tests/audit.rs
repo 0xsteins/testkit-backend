@@ -240,7 +240,10 @@ fn audit_raw_identifiers_report_the_same_rules_as_ordinary_identifiers() {
             }
         }
     }
-    assert_eq!(reports[0].len(), 6, "{reports:?}");
+    // Six raw findings fire (require-auth, ttl, positive-amount, transfer,
+    // and two i128 additions), but the two i128 findings share a
+    // file/line/column/rule and collapse, so both spellings report five.
+    assert_eq!(reports[0].len(), 5, "{reports:?}");
     assert_eq!(reports[0], reports[1]);
 }
 
