@@ -412,6 +412,12 @@ impl TestEnv {
     /// / [`TestToken::mint_raw`] need no global auth mocking; other operations
     /// still do — see [`crate::tokens`].
     ///
+    /// The token admin is an implementation detail of the double and does **not**
+    /// advance the `TestEnv` address stream. Calling `token()` before, after, or
+    /// between [`TestEnv::address`] / [`TestEnv::addresses`] calls therefore has
+    /// no effect on subsequent address generation: the seeded sequence remains
+    /// stable regardless of call order.
+    ///
     /// # Example
     ///
     /// ```
@@ -422,7 +428,14 @@ impl TestEnv {
     /// assert_eq!(token.decimals(), 7);
     /// ```
     pub fn token(&self) -> TestToken {
-        let admin = self.address();
+        // Use the raw SDK generator for the admin address so that calling
+        // token() does not advance the TestEnv's own address counter.  The
+        // admin is an internal implementation detail of the double; tests
+        // should never need to refer to it.  Keeping it off the TestEnv
+        // stream means the seeded address sequence stays stable regardless
+        // of how many tokens are created and in what order.
+        use soroban_sdk::testutils::Address as _;
+        let admin = Address::generate(self.env());
         TestToken::new(self.env(), admin)
     }
 
@@ -613,5 +626,64 @@ mod tests {
         wallet.allow(&token.address(), &alice, &spender, &50, &1_000);
         let allowance = TokenClient::new(env.env(), &token.address()).allowance(&alice, &spender);
         assert_eq!(allowance, 50);
+    }
+
+    // ── Bug #462 regression: token() must not advance the TestEnv address stream ──
+
+    #[test]
+    fn token_does_not_consume_a_slot_in_the_address_stream() {
+        // Without the fix, creating a token before generating addresses would
+        // shift every subsequent address by one slot.
+        let with_token_first = TestEnv::with_seed(42);
+        let without_token = TestEnv::with_seed(42);
+
+        let _token = with_token_first.token();
+        let a1 = with_token_first.address();
+
+        let a2 = without_token.address();
+
+        assert_eq!(
+            a1, a2,
+            "token() shifted the address stream; the admin must not draw from TestEnv::address()"
+        );
+    }
+
+    #[test]
+    fn address_sequence_is_stable_regardless_of_token_call_position() {
+        // token() called before, between, and after address() calls must
+        // produce the same sequence a plain env with no token calls would.
+        let env = TestEnv::with_seed(99);
+        let reference = TestEnv::with_seed(99);
+
+        let _t0 = env.token();           // token before first address
+        let a1 = env.address();
+        let _t1 = env.token();           // token between addresses
+        let a2 = env.address();
+        let _t2 = env.token();           // token after second address
+
+        let r1 = reference.address();
+        let r2 = reference.address();
+
+        assert_eq!(a1, r1, "first address shifted by leading token() call");
+        assert_eq!(a2, r2, "second address shifted by interleaved token() call");
+    }
+
+    #[test]
+    fn multiple_tokens_do_not_shift_seeded_address_stream() {
+        let env = TestEnv::with_seed(7);
+        let reference = TestEnv::with_seed(7);
+
+        // Create several tokens then generate a batch.
+        let _t1 = env.token();
+        let _t2 = env.token();
+        let _t3 = env.token();
+        let batch = env.addresses(4);
+
+        let ref_batch = reference.addresses(4);
+
+        assert_eq!(
+            batch, ref_batch,
+            "batch shifted by preceding token() calls"
+        );
     }
 }
