@@ -584,9 +584,10 @@ fn audit_continues_after_read_and_parse_errors_in_every_format() {
         assert!(errors.contains("failed to parse Rust source"), "{errors}");
         assert!(errors.contains("b-invalid.rs:1:"), "{errors}");
         assert!(
-            errors.contains("audit incomplete: 2 scan error(s)"),
+            errors.contains("audit incomplete: 2 parse warning(s)"),
             "{errors}"
         );
+        assert!(errors.contains("audit: warning:"), "{errors}");
         let findings = String::from_utf8_lossy(&output.stdout);
         assert!(findings.contains("z-valid.rs"), "{findings}");
         assert!(findings.contains("missing-require-auth"), "{findings}");
@@ -638,7 +639,7 @@ fn audit_continues_past_permission_denied_files_and_directories() {
         assert!(errors.contains("a-denied.rs"), "{errors}");
         assert!(errors.contains("failed to scan directory"), "{errors}");
         assert!(errors.contains("b-denied"), "{errors}");
-        assert!(errors.contains("2 scan error(s)"), "{errors}");
+        assert!(errors.contains("2 parse warning(s)"), "{errors}");
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(report["findings"][0]["file"], "z-readable.rs");
         assert_eq!(report["summary"]["finding_count"], 1);
@@ -1025,4 +1026,79 @@ fn audit_normalizes_equivalent_spellings_of_one_scan_root() {
     }
     assert_eq!(reports[0], reports[1]);
     assert_eq!(reports[1], reports[2]);
+}
+
+// ---- #487: a parse warning is not a finding ----
+
+#[test]
+fn audit_reports_parse_warnings_on_stderr_and_findings_in_the_report() {
+    let fixture = AuditFixture::new("finding-vs-warning");
+    fixture.write("broken.rs", "fn broken( {\n");
+    fixture.write("good.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--format", "json", "--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+
+    // The report counts only parsed source; the skipped file never becomes
+    // a finding.
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1, "{report}");
+    let files: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| finding["file"].as_str().unwrap())
+        .collect();
+    assert_eq!(files, vec!["good.rs"], "{report}");
+
+    // The warning lives only on stderr, labelled as a warning, with the
+    // finding/warning distinction stated alongside it.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("audit: warning: failed to parse Rust source"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("parse warnings are not findings"), "{stderr}");
+    assert!(
+        stderr.contains("audit incomplete: 1 parse warning(s)"),
+        "{stderr}"
+    );
+    // The incomplete audit — not --strict — is what failed this run.
+    assert!(!stderr.contains("(--strict)"), "{stderr}");
+}
+
+#[test]
+fn audit_parse_warnings_fail_the_run_without_acting_like_strict_findings() {
+    let fixture = AuditFixture::new("warnings-not-findings");
+    fixture.write("clean.rs", "// nothing to scan\n");
+    fixture.write("broken.rs", "fn broken( {\n");
+
+    let output = fixture.scan(&["--format", "json", "--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 0, "{report}");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("audit incomplete: 1 parse warning(s)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("parse warnings are not findings"), "{stderr}");
+    // No heuristic finding existed, so the strict-failure wording must not
+    // appear: parse warnings never reach --strict.
+    assert!(!stderr.contains("audit finding(s)"), "{stderr}");
+}
+
+#[test]
+fn audit_strict_failure_reports_findings_and_no_parse_warnings() {
+    let fixture = AuditFixture::new("strict-findings-only");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--format", "json", "--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("1 audit finding(s) (--strict)"), "{stderr}");
+    assert!(!stderr.contains("parse warning"), "{stderr}");
+    assert!(!stderr.contains("audit: warning:"), "{stderr}");
 }

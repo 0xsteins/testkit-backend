@@ -26,6 +26,16 @@ pub const MACRO_SOURCE_LIMITATION: &str =
 pub const FINDING_NATURE: &str =
     "heuristic: each finding is a pattern-match signal for manual review, possibly a false positive; it is not a definitive defect report and a clean scan is not a security guarantee";
 
+/// How to read a parse warning as distinct from a finding. A **finding** is
+/// a heuristic pattern match over source that parsed successfully: it is
+/// rendered in the report, counted in `summary.finding_count`, and is the
+/// only thing `--strict` fails on. A **parse warning** means an input could
+/// not be read or parsed, so it was never scanned at all: warnings go to
+/// stderr only, never count as findings, and make the audit incomplete
+/// rather than a strict-mode failure.
+pub const PARSE_WARNING_NATURE: &str =
+    "parse warnings are not findings: an input that could not be read or parsed was skipped without being scanned; warnings are reported on stderr only, never counted in finding_count, and never trigger --strict; they make the audit incomplete instead";
+
 /// Single mapping from a rule severity to a SARIF reporting level. Both the
 /// `rules` metadata and the `results` entries (and the `audit rules`
 /// machine-readable listing) route through this one function, so the
@@ -93,8 +103,11 @@ pub struct AuditArgs {
     /// Findings and baseline entries use workspace-relative paths. Config is
     /// discovered from the source directory up to the workspace root (or
     /// from the current directory for stdin). Files that cannot be read or
-    /// parsed are reported on stderr; other files are scanned, then the
-    /// command exits non-zero to indicate an incomplete audit.
+    /// parsed produce a *parse warning* on stderr — an input skipped, never
+    /// scanned — not a finding: warnings never appear in the report, never
+    /// count toward `finding_count`, and never trigger `--strict`. Other
+    /// files are scanned, then the command exits non-zero to indicate an
+    /// incomplete audit.
     ///
     /// This static scan does not expand procedural macros or macro_rules!
     /// invocations. Inspect generated code separately (e.g. cargo expand).
@@ -235,11 +248,11 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     }
 
     let stdin = args.path == Path::new("-");
-    let mut scan_errors = Vec::new();
+    let mut parse_warnings = Vec::new();
     let sources = if stdin {
         Vec::new()
     } else {
-        collect_rust_sources(&args.path, &mut scan_errors)?
+        collect_rust_sources(&args.path, &mut parse_warnings)?
     };
     let source_dir = if stdin {
         canonical_path(&std::env::current_dir()?)?
@@ -273,12 +286,12 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
             &config,
             &source,
         ) {
-            scan_errors.push(err);
+            parse_warnings.push(err);
         }
     } else {
         for path in sources {
             if let Err(err) = audit_file(&path, &mut findings, &config) {
-                scan_errors.push(err);
+                parse_warnings.push(err);
             }
         }
         for finding in &mut findings {
@@ -290,14 +303,19 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
 
     print!("{}", render_findings(&findings, args.format)?);
 
-    if !scan_errors.is_empty() {
-        for error in &scan_errors {
-            eprintln!("audit: {error}");
+    // Findings (heuristic pattern matches over parsed source) were just
+    // rendered above; these are parse warnings (inputs that were never
+    // scanned), and the two are reported through different channels on
+    // purpose so a skipped file can never be mistaken for a finding.
+    if !parse_warnings.is_empty() {
+        for warning in &parse_warnings {
+            eprintln!("audit: warning: {warning}");
         }
+        eprintln!("audit: note: {PARSE_WARNING_NATURE}");
         return Err(CliError(format!(
-            "audit incomplete: {} scan error(s); findings cover only successfully parsed files; \
-             fix the reported paths and re-run",
-            scan_errors.len()
+            "audit incomplete: {} parse warning(s); findings cover only successfully parsed files; \
+             fix the reported inputs and re-run",
+            parse_warnings.len()
         )));
     }
 
@@ -343,7 +361,10 @@ fn is_scannable_entry(entry: &walkdir::DirEntry) -> bool {
 /// A root that does not exist is an error, not an empty scan: silently
 /// reporting "no findings" for a typo'd path would be worse than useless in
 /// CI, so the message names every supported input form.
-fn collect_rust_sources(root: &Path, errors: &mut Vec<CliError>) -> Result<Vec<PathBuf>, CliError> {
+fn collect_rust_sources(
+    root: &Path,
+    warnings: &mut Vec<CliError>,
+) -> Result<Vec<PathBuf>, CliError> {
     fs::metadata(root).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             CliError(format!(
@@ -368,7 +389,7 @@ fn collect_rust_sources(root: &Path, errors: &mut Vec<CliError>) -> Result<Vec<P
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
-                errors.push(CliError(format!(
+                warnings.push(CliError(format!(
                     "failed to scan directory {}: {err}; check path permissions and re-run",
                     err.path().unwrap_or(root).display()
                 )));
