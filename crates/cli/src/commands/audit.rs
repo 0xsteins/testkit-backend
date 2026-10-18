@@ -9,7 +9,7 @@ use quote::ToTokens;
 use serde::{Deserialize, Serialize};
 use syn::ext::IdentExt;
 use syn::visit::{self, Visit};
-use syn::{BinOp, Expr, FnArg, ImplItemFn, ItemFn, Local, Pat, Signature, Type};
+use syn::{BinOp, Expr, FnArg, ImplItemFn, ItemFn, Local, Pat, Signature, Type, UnOp};
 use walkdir::WalkDir;
 
 use super::CliError;
@@ -179,9 +179,13 @@ struct BaselineEntry {
 
 impl Finding {
     fn matches_baseline(&self, entry: &BaselineEntry) -> bool {
-        self.file.to_string_lossy() == entry.file
-            && self.line == entry.line
-            && self.rule == entry.rule
+        let file_str = self.file.to_string_lossy();
+        let entry_file = entry.file.as_str();
+        let file_matches = file_str == entry_file
+            || file_str.strip_prefix("./").unwrap_or(&file_str)
+                == entry_file.strip_prefix("./").unwrap_or(entry_file);
+
+        file_matches && self.line == entry.line && self.rule == entry.rule
     }
 }
 
@@ -287,6 +291,13 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     }
 
     findings.retain(|f| !baseline.iter().any(|b| f.matches_baseline(b)));
+    findings.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.rule.cmp(b.rule))
+            .then_with(|| a.message.cmp(&b.message))
+    });
 
     print!("{}", render_findings(&findings, args.format)?);
 
@@ -531,6 +542,18 @@ impl<'a> DiagnosticRenderer<'a> {
         }
     }
 
+    fn sorted_findings(&self) -> Vec<&Finding> {
+        let mut sorted: Vec<&Finding> = self.findings.iter().collect();
+        sorted.sort_by(|a, b| {
+            a.file
+                .cmp(&b.file)
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.rule.cmp(b.rule))
+                .then_with(|| a.message.cmp(&b.message))
+        });
+        sorted
+    }
+
     /// Render compiler-style human-readable text diagnostics.
     ///
     /// Every finding carries the offending source line (`-->`), with ANSI
@@ -544,8 +567,9 @@ impl<'a> DiagnosticRenderer<'a> {
             );
         }
 
+        let sorted = self.sorted_findings();
         let mut output = String::new();
-        for finding in self.findings {
+        for finding in sorted {
             output.push_str(&format!(
                 "{}:{}: [{}] {}: {}\n",
                 finding.file.display(),
@@ -572,6 +596,16 @@ impl<'a> DiagnosticRenderer<'a> {
     /// sanitized before serialization so no terminal control sequence
     /// survives transport.
     pub fn render_json(&self) -> Result<String, CliError> {
+ feat/audit-hardening-437-431-430-429
+        let sorted = self.sorted_findings();
+        serde_json::to_string_pretty(&serde_json::json!({
+            "tool": "soroban-testkit",
+            "version": 1,
+            "findings": sorted,
+            "summary": {
+                "finding_count": sorted.len(),
+                "limitations": [MACRO_SOURCE_LIMITATION]
+
         let findings: Vec<_> = self
             .findings
             .iter()
@@ -591,6 +625,7 @@ impl<'a> DiagnosticRenderer<'a> {
             "summary": {
                 "finding_count": self.findings.len(),
                 "limitations": [MACRO_SOURCE_LIMITATION, FINDING_NATURE]
+ main
             }
         }))
         .map(|report| format!("{report}\n"))
@@ -604,7 +639,8 @@ impl<'a> DiagnosticRenderer<'a> {
     /// `level` on its `results`. Region snippets are sanitized before
     /// embedding.
     pub fn render_sarif(&self) -> Result<String, CliError> {
-        let mut rule_ids: Vec<_> = self.findings.iter().map(|finding| finding.rule).collect();
+        let sorted = self.sorted_findings();
+        let mut rule_ids: Vec<_> = sorted.iter().map(|finding| finding.rule).collect();
         rule_ids.sort_unstable();
         rule_ids.dedup();
         let rules: Vec<_> = rule_ids
@@ -644,8 +680,7 @@ impl<'a> DiagnosticRenderer<'a> {
                 rule_obj
             })
             .collect();
-        let results: Vec<_> = self
-            .findings
+        let results: Vec<_> = sorted
             .iter()
             .map(|finding| {
                 let region = match &finding.source_snippet {
@@ -689,14 +724,17 @@ pub fn render_findings(
     DiagnosticRenderer::new(findings).render(format)
 }
 
+#[allow(dead_code)]
 pub fn render_text(findings: &[Finding]) -> String {
     DiagnosticRenderer::new(findings).render_text()
 }
 
+#[allow(dead_code)]
 pub fn render_json(findings: &[Finding]) -> Result<String, CliError> {
     DiagnosticRenderer::new(findings).render_json()
 }
 
+#[allow(dead_code)]
 pub fn render_sarif(findings: &[Finding]) -> Result<String, CliError> {
     DiagnosticRenderer::new(findings).render_sarif()
 }
@@ -852,39 +890,244 @@ struct Suppression {
     reason: Option<String>,
 }
 
+fn find_audit_directive(line: &str) -> Option<&str> {
+    let lower = line.to_lowercase();
+    let prefix_pos = lower
+        .find("soroban_testkit")
+        .or_else(|| lower.find("soroban-testkit"))?;
+    let after_prefix = &line[prefix_pos..];
+    let audit_pos = after_prefix.to_lowercase().find("audit")?;
+    let after_audit = &after_prefix[audit_pos + "audit".len()..];
+    let open_paren = after_audit.find('(')?;
+    let close_paren = after_audit.rfind(')')?;
+    if close_paren > open_paren {
+        Some(&after_audit[open_paren + 1..close_paren])
+    } else {
+        None
+    }
+}
+
 fn extract_suppressions(src: &str) -> Vec<Suppression> {
     let mut suppressions = Vec::new();
     for (idx, line) in src.lines().enumerate() {
-        if let Some(comment_start) = line.find("soroban_testkit::audit(skip") {
-            if let Some(comment_text) = line[comment_start..].split_once('(') {
-                if let Some(end_paren) = comment_text.1.rfind(')') {
-                    let content = &comment_text.1[..end_paren];
-                    let mut rules = Vec::new();
-                    let mut reason = None;
+        if let Some(content) = find_audit_directive(line) {
+            let mut rules = Vec::new();
+            let mut reason = None;
 
-                    for part in content.split(',') {
-                        let part = part.trim();
-                        if let Some(stripped) = part.strip_prefix("reason=") {
-                            reason = Some(stripped.trim_matches('"').to_string());
-                        } else if !part.is_empty() && part != "skip" {
-                            rules.push(part.to_string());
-                        }
-                    }
+            for part in content.split(',') {
+                let part = part.trim();
+                let clean = if let Some(stripped) = part.strip_prefix("reason=") {
+                    reason = Some(
+                        stripped
+                            .trim()
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .to_string(),
+                    );
+                    continue;
+                } else if let Some(stripped) = part.strip_prefix("reason =") {
+                    reason = Some(
+                        stripped
+                            .trim()
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .to_string(),
+                    );
+                    continue;
+                } else if let Some(stripped) = part.strip_prefix("rule=") {
+                    stripped
+                } else if let Some(stripped) = part.strip_prefix("rule =") {
+                    stripped
+                } else if let Some(stripped) = part.strip_prefix("rule:") {
+                    stripped
+                } else if let Some(stripped) = part.strip_prefix("rule :") {
+                    stripped
+                } else if let Some(stripped) = part.strip_prefix("skip-") {
+                    stripped
+                } else {
+                    part
+                };
 
-                    if rules.is_empty() {
+                let clean = clean.trim().trim_matches('"').trim_matches('\'').trim();
+                if !clean.is_empty() && clean != "skip" {
+                    if clean == "all" || clean == "*" {
                         rules.push("*".to_string());
+                    } else {
+                        rules.push(clean.to_string());
                     }
-
-                    suppressions.push(Suppression {
-                        line: idx + 1,
-                        rules,
-                        reason,
-                    });
                 }
             }
+
+            if rules.is_empty() {
+                rules.push("*".to_string());
+            }
+
+            suppressions.push(Suppression {
+                line: idx + 1,
+                rules,
+                reason,
+            });
         }
     }
     suppressions
+}
+
+fn item_line_range(node: impl quote::ToTokens) -> (usize, usize) {
+    let tokens = node.to_token_stream();
+    let mut min_line = usize::MAX;
+    let mut max_line = 0;
+    for token in tokens {
+        let span = token.span();
+        let start = span.start().line;
+        let end = span.end().line;
+        if start < min_line {
+            min_line = start;
+        }
+        if end > max_line {
+            max_line = end;
+        }
+    }
+    if min_line == usize::MAX {
+        (0, 0)
+    } else {
+        (min_line, max_line)
+    }
+}
+
+fn is_finding_suppressed(
+    suppressions: &[Suppression],
+    rule: &str,
+    finding_line: usize,
+    fn_range: Option<(usize, usize)>,
+) -> bool {
+    for suppression in suppressions {
+        let matches_rule = suppression.rules.iter().any(|r| r == "*" || r == rule);
+        if !matches_rule {
+            continue;
+        }
+
+        // 1. File-level suppression (top of file before items, e.g. line <= 10)
+        if suppression.line <= 10 {
+            return true;
+        }
+
+        // 2. Direct line match (finding is on the same line or line immediately following suppression)
+        if suppression.line == finding_line || suppression.line + 1 == finding_line {
+            return true;
+        }
+
+        // 3. Function-level suppression (suppression is immediately above function or inside function)
+        if let Some((start, end)) = fn_range {
+            if suppression.line + 1 >= start && suppression.line <= end {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_require_auth_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::MethodCall(call) => {
+            let method = call.method.to_string();
+            method == "require_auth" || method == "require_auth_for_args"
+        }
+        Expr::Call(call) => match &*call.func {
+            Expr::Path(expr_path) => {
+                if let Some(last_seg) = expr_path.path.segments.last() {
+                    let ident = last_seg.ident.to_string();
+                    ident == "require_auth" || ident == "require_auth_for_args"
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        },
+        Expr::Paren(paren) => is_require_auth_call(&paren.expr),
+        Expr::Group(group) => is_require_auth_call(&group.expr),
+        Expr::Try(t) => is_require_auth_call(&t.expr),
+        Expr::Await(a) => is_require_auth_call(&a.base),
+        _ => false,
+    }
+}
+
+fn is_negated_condition(expr: &Expr) -> bool {
+    match expr {
+        Expr::Unary(syn::ExprUnary {
+            op: UnOp::Not(_), ..
+        }) => true,
+        Expr::Paren(paren) => is_negated_condition(&paren.expr),
+        Expr::Group(group) => is_negated_condition(&group.expr),
+        Expr::Binary(syn::ExprBinary {
+            left,
+            op: BinOp::Eq(_),
+            right,
+            ..
+        }) => is_lit_false(left) || is_lit_false(right),
+        Expr::Binary(syn::ExprBinary {
+            left,
+            op: BinOp::Ne(_),
+            right,
+            ..
+        }) => is_lit_true(left) || is_lit_true(right),
+        _ => false,
+    }
+}
+
+fn is_lit_false(expr: &Expr) -> bool {
+    matches!(expr, Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(b), .. }) if !b.value)
+}
+
+fn is_lit_true(expr: &Expr) -> bool {
+    matches!(expr, Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(b), .. }) if b.value)
+}
+
+struct AuthVisitor {
+    negated_depth: usize,
+    has_enforced_auth: bool,
+}
+
+impl<'ast> Visit<'ast> for AuthVisitor {
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        if is_require_auth_call(expr) && self.negated_depth == 0 {
+            self.has_enforced_auth = true;
+        }
+        visit::visit_expr(self, expr);
+    }
+
+    fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+        let is_negated = is_negated_condition(&node.cond);
+        if is_negated {
+            self.negated_depth += 1;
+        }
+        self.visit_block(&node.then_branch);
+        if is_negated {
+            self.negated_depth -= 1;
+        }
+        if let Some((_, else_branch)) = &node.else_branch {
+            self.visit_expr(else_branch);
+        }
+    }
+
+    fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+        let is_negated = is_negated_condition(&node.cond);
+        if is_negated {
+            self.negated_depth += 1;
+        }
+        self.visit_block(&node.body);
+        if is_negated {
+            self.negated_depth -= 1;
+        }
+    }
+}
+
+fn has_enforced_require_auth(block: &syn::Block) -> bool {
+    let mut visitor = AuthVisitor {
+        negated_depth: 0,
+        has_enforced_auth: false,
+    };
+    visitor.visit_block(block);
+    visitor.has_enforced_auth
 }
 
 struct FunctionVisitor<'a> {
@@ -898,6 +1141,16 @@ struct FunctionVisitor<'a> {
 
 impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
+ feat/audit-hardening-437-431-430-429
+        let line = line_of(node);
+        let fn_range = item_line_range(node);
+        let fn_name = node.sig.ident.to_string();
+        let body_src = node.to_token_stream().to_string();
+        self.audit_function(&node.sig, &node.block, body_src.clone(), line, fn_range);
+        self.audit_i128_arithmetic(&node.sig, &node.block, line, fn_range);
+        self.audit_ignored_transfer_results(&node.sig, &node.block, fn_range);
+        self.audit_mock_all_auths(&body_src, line, &fn_name, fn_range);
+
         let (line, column) = position_of(node, self.source);
         self.current_column = column;
         let fn_name = node.sig.ident.to_string();
@@ -906,10 +1159,20 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
         self.audit_i128_arithmetic(&node.sig, &node.block, line);
         self.audit_ignored_transfer_results(&node.sig, &node.block);
         self.audit_mock_all_auths(&node.block, line, &fn_name);
+ main
         visit::visit_item_fn(self, node);
     }
 
-    fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
+    fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) { feat/audit-hardening-437-431-430-429
+        let line = line_of(node);
+        let fn_range = item_line_range(node);
+        let fn_name = node.sig.ident.to_string();
+        let body_src = node.to_token_stream().to_string();
+        self.audit_function(&node.sig, &node.block, body_src.clone(), line, fn_range);
+        self.audit_i128_arithmetic(&node.sig, &node.block, line, fn_range);
+        self.audit_ignored_transfer_results(&node.sig, &node.block, fn_range);
+        self.audit_mock_all_auths(&body_src, line, &fn_name, fn_range);
+
         let (line, column) = position_of(node, self.source);
         self.current_column = column;
         let fn_name = node.sig.ident.to_string();
@@ -918,6 +1181,7 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
         self.audit_i128_arithmetic(&node.sig, &node.block, line);
         self.audit_ignored_transfer_results(&node.sig, &node.block);
         self.audit_mock_all_auths(&node.block, line, &fn_name);
+ main
         visit::visit_impl_item_fn(self, node);
     }
 }
@@ -941,14 +1205,26 @@ fn normalized_tokens(tokens: TokenStream) -> TokenStream {
 }
 
 impl FunctionVisitor<'_> {
-    fn audit_function(&mut self, sig: &Signature, block: &syn::Block, body_src: String, line: usize) {
+    fn audit_function(
+        &mut self,
+        sig: &Signature,
+        block: &syn::Block,
+        body_src: String,
+        line: usize,
+        fn_range: (usize, usize),
+    ) {
         let name = sig.ident.to_string();
 
         // Rule 1: an Address parameter that's never checked with require_auth.
         if self.is_enabled("missing-require-auth") {
             let address_params = address_typed_params(sig);
+ feat/audit-hardening-437-431-430-429
+            if !address_params.is_empty() && !has_enforced_require_auth(block) {
+                self.push_with_range(
+
             if !address_params.is_empty() && !contains_method_call(block, "require_auth") {
                 self.push(
+ main
                     line,
                     "missing-require-auth",
                     "warning",
@@ -956,6 +1232,7 @@ impl FunctionVisitor<'_> {
                         "fn {name} takes Address parameter(s) {address_params:?} but never calls \
                          require_auth in its body"
                     ),
+                    Some(fn_range),
                 );
             }
         }
@@ -965,7 +1242,7 @@ impl FunctionVisitor<'_> {
             let reads_persistent = body_src.contains(". persistent () . get (");
             let reads_temporary = body_src.contains(". temporary () . get (");
             if (reads_persistent || reads_temporary) && !body_src.contains(". extend_ttl (") {
-                self.push(
+                self.push_with_range(
                     line,
                     "missing-ttl-bump",
                     "warning",
@@ -977,6 +1254,7 @@ impl FunctionVisitor<'_> {
                             "temporary"
                         }
                     ),
+                    Some(fn_range),
                 );
             }
         }
@@ -984,7 +1262,7 @@ impl FunctionVisitor<'_> {
         if self.is_enabled("missing-positive-amount-validation") {
             for amount_param in signed_amount_params(sig) {
                 if !has_positive_amount_validation(&body_src, &amount_param) {
-                    self.push(
+                    self.push_with_range(
                         line,
                         "missing-positive-amount-validation",
                         "warning",
@@ -992,6 +1270,7 @@ impl FunctionVisitor<'_> {
                             "fn {name} takes signed amount parameter `{amount_param}` but never \
                              validates it against zero"
                         ),
+                        Some(fn_range),
                     );
                 }
             }
@@ -1009,20 +1288,31 @@ impl FunctionVisitor<'_> {
             if has_timestamp_ops && !is_checked && body_src.contains("timestamp") {
                 // Check if it's likely timestamp arithmetic
                 if body_src.contains("timestamp()") || body_src.contains("timestamp ") {
-                    self.push(
+                    self.push_with_range(
                         line,
                         "unchecked-timestamp-arithmetic",
                         "warning",
                         format!(
                             "fn {name} performs arithmetic on timestamp values; use checked arithmetic to prevent overflow"
                         ),
+                        Some(fn_range),
                     );
                 }
             }
         }
     }
 
+ feat/audit-hardening-437-431-430-429
+    fn audit_mock_all_auths(
+        &mut self,
+        body_src: &str,
+        line: usize,
+        fn_name: &str,
+        fn_range: (usize, usize),
+    ) {
+
     fn audit_mock_all_auths(&mut self, block: &syn::Block, line: usize, fn_name: &str) {
+ main
         if !self.is_enabled("broad-mock-all-auths") {
             return;
         }
@@ -1032,14 +1322,20 @@ impl FunctionVisitor<'_> {
             return;
         }
 
+ feat/audit-hardening-437-431-430-429
+        if body_src.contains("mock_all_auths") {
+            self.push_with_range(
+
         if contains_method_call(block, "mock_all_auths") {
             self.push(
+ main
                 line,
                 "broad-mock-all-auths",
                 "warning",
                 format!(
                     "test function {fn_name} uses mock_all_auths; prefer granular auth checks per caller"
                 ),
+                Some(fn_range),
             );
         }
     }
@@ -1052,6 +1348,7 @@ impl FunctionVisitor<'_> {
             .unwrap_or(true)
     }
 
+    #[allow(dead_code)]
     fn push(
         &mut self,
         line: usize,
@@ -1059,18 +1356,23 @@ impl FunctionVisitor<'_> {
         default_severity: &'static str,
         message: String,
     ) {
+        self.push_with_range(line, rule, default_severity, message, None);
+    }
+
+    fn push_with_range(
+        &mut self,
+        line: usize,
+        rule: &'static str,
+        default_severity: &'static str,
+        message: String,
+        fn_range: Option<(usize, usize)>,
+    ) {
         if !self.is_enabled(rule) {
             return;
         }
 
-        // Check if this finding is suppressed
-        for suppression in self.suppressions {
-            if (suppression.line == line || suppression.line == line - 1)
-                && (suppression.rules.contains(&"*".to_string())
-                    || suppression.rules.iter().any(|r| r == rule))
-            {
-                return;
-            }
+        if is_finding_suppressed(self.suppressions, rule, line, fn_range) {
+            return;
         }
 
         let severity = self
@@ -1097,7 +1399,13 @@ impl FunctionVisitor<'_> {
         });
     }
 
-    fn audit_i128_arithmetic(&mut self, sig: &Signature, body: &syn::Block, line: usize) {
+    fn audit_i128_arithmetic(
+        &mut self,
+        sig: &Signature,
+        body: &syn::Block,
+        line: usize,
+        fn_range: (usize, usize),
+    ) {
         if !self.is_enabled("unchecked-i128-arithmetic") {
             return;
         }
@@ -1117,6 +1425,7 @@ impl FunctionVisitor<'_> {
             path: self.path.clone(),
             fn_name: sig.ident.to_string(),
             fn_line: line,
+            fn_range,
             i128_bindings,
             findings: self.findings,
             config: self.config,
@@ -1126,7 +1435,12 @@ impl FunctionVisitor<'_> {
         visitor.visit_block(body);
     }
 
-    fn audit_ignored_transfer_results(&mut self, sig: &Signature, body: &syn::Block) {
+    fn audit_ignored_transfer_results(
+        &mut self,
+        sig: &Signature,
+        body: &syn::Block,
+        fn_range: (usize, usize),
+    ) {
         if !self.is_enabled("ignored-token-transfer-result") {
             return;
         }
@@ -1134,6 +1448,7 @@ impl FunctionVisitor<'_> {
         let mut visitor = IgnoredTransferVisitor {
             path: self.path.clone(),
             fn_name: sig.ident.to_string(),
+            fn_range,
             findings: self.findings,
             config: self.config,
             suppressions: self.suppressions,
@@ -1242,6 +1557,7 @@ fn contains_method_call(block: &syn::Block, method: &str) -> bool {
 struct IgnoredTransferVisitor<'a> {
     path: PathBuf,
     fn_name: String,
+    fn_range: (usize, usize),
     findings: &'a mut Vec<Finding>,
     config: &'a AuditConfig,
     suppressions: &'a [Suppression],
@@ -1266,6 +1582,15 @@ impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
         };
 
         if let Some(expr) = ignored_call {
+ feat/audit-hardening-437-431-430-429
+            let line = line_of(expr);
+            let is_suppressed = is_finding_suppressed(
+                self.suppressions,
+                "ignored-token-transfer-result",
+                line,
+                Some(self.fn_range),
+            );
+
             let (line, column) = position_of(expr, self.source);
             let is_suppressed = self.suppressions.iter().any(|s| {
                 (s.line == line || s.line == line - 1)
@@ -1273,6 +1598,7 @@ impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
                         || s.rules
                             .contains(&"ignored-token-transfer-result".to_string()))
             });
+ main
 
             if !is_suppressed {
                 let severity = self
@@ -1337,7 +1663,11 @@ struct I128ArithmeticVisitor<'a> {
     path: PathBuf,
     fn_name: String,
     fn_line: usize,
+ feat/audit-hardening-437-431-430-429
+    fn_range: (usize, usize),
+
     fn_column: usize,
+ main
     i128_bindings: HashSet<String>,
     findings: &'a mut Vec<Finding>,
     config: &'a AuditConfig,
@@ -1364,11 +1694,13 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
             BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_) | BinOp::Div(_)
         );
         if is_arith && (self.touches_i128(&node.left) || self.touches_i128(&node.right)) {
-            let is_suppressed = self.suppressions.iter().any(|s| {
-                (s.line == self.fn_line || s.line == self.fn_line - 1)
-                    && (s.rules.contains(&"*".to_string())
-                        || s.rules.contains(&"unchecked-i128-arithmetic".to_string()))
-            });
+            let expr_line = line_of(node);
+            let is_suppressed = is_finding_suppressed(
+                self.suppressions,
+                "unchecked-i128-arithmetic",
+                expr_line,
+                Some(self.fn_range),
+            );
 
             if !is_suppressed {
                 let severity = self
@@ -1380,8 +1712,16 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
 
                 self.findings.push(Finding {
                     file: self.path.clone(),
+ feat/audit-hardening-437-431-430-429
+                    line: if expr_line > 0 {
+                        expr_line
+                    } else {
+                        self.fn_line
+                    },
+
                     line: self.fn_line,
                     column: self.fn_column,
+                  main
                     rule: "unchecked-i128-arithmetic",
                     severity: severity.to_string(),
                     message: format!(
@@ -1804,6 +2144,309 @@ mod tests {
         assert!(err.0.contains("stdin"), "{}", err.0);
     }
 
+ feat/audit-hardening-437-431-430-429
+    // ---- #437: avoid counting suppressed findings toward strict exit status ----
+
+    #[test]
+    fn suppression_with_rule_name_skips_finding() {
+        let findings = audit_source_for_test(
+            r#"
+            #[contractimpl]
+            impl Contract {
+                // soroban_testkit::audit(skip, rule = "missing-require-auth")
+                pub fn withdraw(env: Env, from: Address) {
+                    env.storage().instance().set(&from, &1i128);
+                }
+            }
+            "#,
+        );
+        assert!(!findings.iter().any(|f| f.rule == "missing-require-auth"));
+    }
+
+    #[test]
+    fn suppression_with_hyphenated_directive_and_reason_skips_finding() {
+        let findings = audit_source_for_test(
+            r#"
+            #[contractimpl]
+            impl Contract {
+                // soroban-testkit::audit(skip, rule="missing-require-auth", reason="admin controlled")
+                pub fn withdraw(env: Env, from: Address) {
+                    env.storage().instance().set(&from, &1i128);
+                }
+            }
+            "#,
+        );
+        assert!(!findings.iter().any(|f| f.rule == "missing-require-auth"));
+    }
+
+    #[test]
+    fn function_level_suppression_with_attributes_and_docs_skips_finding() {
+        let findings = audit_source_for_test(
+            r#"
+            #[contractimpl]
+            impl Contract {
+                // soroban_testkit::audit(skip)
+                /// Documenting this function
+                #[allow(dead_code)]
+                pub fn withdraw(env: Env, from: Address) {
+                    env.storage().instance().set(&from, &1i128);
+                }
+            }
+            "#,
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn inside_body_suppression_skips_arithmetic_finding() {
+        let findings = audit_source_for_test(
+            r#"
+            pub fn calc(amount: i128) -> i128 {
+                // soroban_testkit::audit(skip, rule = "unchecked-i128-arithmetic")
+                amount + 100
+            }
+            "#,
+        );
+        assert!(!findings
+            .iter()
+            .any(|f| f.rule == "unchecked-i128-arithmetic"));
+    }
+
+    #[test]
+    fn function_level_suppression_skips_ignored_transfer_finding() {
+        let findings = audit_source_for_test(
+            r#"
+            // soroban_testkit::audit(skip, rule = "ignored-token-transfer-result")
+            pub fn pay(token: TokenClient, to: Address, amount: i128) {
+                assert!(amount > 0);
+                token.try_transfer(&to, &amount);
+            }
+            "#,
+        );
+        assert!(!findings
+            .iter()
+            .any(|f| f.rule == "ignored-token-transfer-result"));
+    }
+
+    #[test]
+    fn file_level_suppression_skips_all_findings_in_file() {
+        let findings = audit_source_for_test(
+            r#"
+            // soroban_testkit::audit(skip)
+            pub fn withdraw(env: Env, from: Address) {
+                let amount: i128 = 100;
+                let _ = amount + 5;
+            }
+            "#,
+        );
+        assert!(findings.is_empty());
+    }
+
+    // ---- #431: recognize qualified require_auth calls ----
+
+    #[test]
+    fn qualified_address_require_auth_call_is_recognized() {
+        let findings = audit_source_for_test(
+            r#"
+            #[contractimpl]
+            impl Contract {
+                pub fn withdraw(env: Env, from: Address) {
+                    Address::require_auth(&from);
+                }
+            }
+            "#,
+        );
+        assert!(!findings.iter().any(|f| f.rule == "missing-require-auth"));
+    }
+
+    #[test]
+    fn fully_qualified_soroban_sdk_require_auth_is_recognized() {
+        let findings = audit_source_for_test(
+            r#"
+            #[contractimpl]
+            impl Contract {
+                pub fn withdraw(env: Env, from: Address) {
+                    soroban_sdk::Address::require_auth(&from);
+                }
+            }
+            "#,
+        );
+        assert!(!findings.iter().any(|f| f.rule == "missing-require-auth"));
+    }
+
+    #[test]
+    fn qualified_auth_module_require_auth_is_recognized() {
+        let findings = audit_source_for_test(
+            r#"
+            #[contractimpl]
+            impl Contract {
+                pub fn withdraw(env: Env, from: Address) {
+                    auth::require_auth(&from);
+                }
+            }
+            "#,
+        );
+        assert!(!findings.iter().any(|f| f.rule == "missing-require-auth"));
+    }
+
+    #[test]
+    fn qualified_require_auth_for_args_is_recognized() {
+        let findings = audit_source_for_test(
+            r#"
+            #[contractimpl]
+            impl Contract {
+                pub fn withdraw(env: Env, from: Address, amount: i128) {
+                    assert!(amount > 0);
+                    Address::require_auth_for_args(&from, (&amount,));
+                }
+            }
+            "#,
+        );
+        assert!(!findings.iter().any(|f| f.rule == "missing-require-auth"));
+    }
+
+    // ---- #430: do not treat a negated auth branch as an enforced check ----
+
+    #[test]
+    fn negated_if_condition_auth_branch_is_not_treated_as_enforced() {
+        let findings = audit_source_for_test(
+            r#"
+            #[contractimpl]
+            impl Contract {
+                pub fn withdraw(env: Env, from: Address) {
+                    if !condition {
+                        from.require_auth();
+                    }
+                }
+            }
+            "#,
+        );
+        assert!(findings.iter().any(|f| f.rule == "missing-require-auth"));
+    }
+
+    #[test]
+    fn negated_qualified_auth_branch_is_not_treated_as_enforced() {
+        let findings = audit_source_for_test(
+            r#"
+            #[contractimpl]
+            impl Contract {
+                pub fn withdraw(env: Env, from: Address) {
+                    if !is_admin {
+                        Address::require_auth(&from);
+                    }
+                }
+            }
+            "#,
+        );
+        assert!(findings.iter().any(|f| f.rule == "missing-require-auth"));
+    }
+
+    #[test]
+    fn negated_boolean_comparison_branch_is_not_treated_as_enforced() {
+        let findings = audit_source_for_test(
+            r#"
+            #[contractimpl]
+            impl Contract {
+                pub fn withdraw(env: Env, from: Address) {
+                    if condition == false {
+                        from.require_auth();
+                    }
+                }
+            }
+            "#,
+        );
+        assert!(findings.iter().any(|f| f.rule == "missing-require-auth"));
+    }
+
+    #[test]
+    fn unconditional_auth_outside_negated_branch_is_enforced() {
+        let findings = audit_source_for_test(
+            r#"
+            #[contractimpl]
+            impl Contract {
+                pub fn withdraw(env: Env, from: Address) {
+                    from.require_auth();
+                    if !condition {
+                        let _ = 1;
+                    }
+                }
+            }
+            "#,
+        );
+        assert!(!findings.iter().any(|f| f.rule == "missing-require-auth"));
+    }
+
+    // ---- #429: keep repeated runs byte-for-byte deterministic ----
+
+    #[test]
+    fn collect_rust_sources_orders_files_deterministically() {
+        let root = std::env::temp_dir().join(format!("stk-audit-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/z.rs"), "pub fn z() {}").unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn a() {}").unwrap();
+        std::fs::write(root.join("src/m.rs"), "pub fn m() {}").unwrap();
+
+        let sources1 = collect_rust_sources(&root, &mut Vec::new()).unwrap();
+        let sources2 = collect_rust_sources(&root, &mut Vec::new()).unwrap();
+        assert_eq!(sources1, sources2);
+        assert_eq!(
+            sources1,
+            vec![
+                root.join("src/a.rs"),
+                root.join("src/m.rs"),
+                root.join("src/z.rs"),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn diagnostic_rendering_is_deterministic_across_repeated_calls() {
+        let findings = vec![
+            Finding {
+                file: PathBuf::from("src/z.rs"),
+                line: 50,
+                rule: "missing-require-auth",
+                severity: "warning".to_string(),
+                message: "z issue".to_string(),
+            },
+            Finding {
+                file: PathBuf::from("src/a.rs"),
+                line: 10,
+                rule: "missing-ttl-bump",
+                severity: "warning".to_string(),
+                message: "a issue".to_string(),
+            },
+            Finding {
+                file: PathBuf::from("src/a.rs"),
+                line: 5,
+                rule: "missing-require-auth",
+                severity: "warning".to_string(),
+                message: "a auth".to_string(),
+            },
+        ];
+
+        let text1 = render_text(&findings);
+        let text2 = render_text(&findings);
+        assert_eq!(text1, text2);
+
+        let json1 = render_json(&findings).unwrap();
+        let json2 = render_json(&findings).unwrap();
+        assert_eq!(json1, json2);
+
+        let sarif1 = render_sarif(&findings).unwrap();
+        let sarif2 = render_sarif(&findings).unwrap();
+        assert_eq!(sarif1, sarif2);
+
+        // Verify sorted order: src/a.rs line 5 comes before line 10, which comes before src/z.rs line 50
+        let a_auth_pos = text1.find("src/a.rs:5").unwrap();
+        let a_ttl_pos = text1.find("src/a.rs:10").unwrap();
+        let z_pos = text1.find("src/z.rs:50").unwrap();
+        assert!(a_auth_pos < a_ttl_pos);
+        assert!(a_ttl_pos < z_pos);
+
     // ---- #482: findings disclose when they are heuristic, not definitive ----
 
     #[test]
@@ -1918,5 +2561,6 @@ mod tests {
         {
             assert_eq!(finding.source_snippet.as_deref(), Some(source));
         }
+ main
     }
 }
