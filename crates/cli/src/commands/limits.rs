@@ -255,13 +255,15 @@ pub struct RefinementAudit {
 /// Arguments for `soroban-testkit limits`.
 #[derive(Args)]
 pub struct LimitsArgs {
-    /// Path to the compiled contract .wasm file.
+    /// Path to an existing compiled contract .wasm file. Build successfully before
+    /// running limits; this command does not rebuild contracts.
     #[arg(long, value_name = "PATH")]
     contract: std::path::PathBuf,
     /// The contract function to ramp.
     #[arg(long = "fn", value_name = "NAME")]
     function: String,
-    /// The parameter to increase on each attempt.
+    /// The parameter to increase on each attempt. Must exactly match an input
+    /// name in the selected function's contract ABI; checked before probing.
     #[arg(long, value_name = "PARAM")]
     ramp: String,
     /// Explicit value for a non-ramped parameter, as NAME=VALUE. Repeatable.
@@ -479,10 +481,10 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         match probe(low)? {
             ProbeOutcome::Succeeded => {
                 last_ok = Some(low);
-                match low.checked_mul(2) {
+                match next_ramp_value(low, SEARCH_UPPER_BOUND) {
                     Some(next) => low = next,
                     None => {
-                        high = None;
+                        hit_upper_bound = true;
                         break;
                     }
                 }
@@ -493,10 +495,6 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
                 high = Some(low);
                 break;
             }
-        }
-        if low > SEARCH_UPPER_BOUND {
-            hit_upper_bound = true;
-            break;
         }
     }
 
@@ -655,9 +653,21 @@ fn validate_percentage(name: &str, pct: f64) -> Result<(), CliError> {
     Ok(())
 }
 
+// Stop at the cap and clamp the last step, including when doubling would overflow.
+fn next_ramp_value(current: u32, upper_bound: u32) -> Option<u32> {
+    if current >= upper_bound {
+        None
+    } else {
+        Some(current.saturating_mul(2).min(upper_bound))
+    }
+}
+
 /// Refines the boundary between a known success (`low`) and a known failure (`high`)
 /// using binary search, recording every intermediate step in a [`RefinementAudit`]
 /// — including the standardized [`ProbeFailureCategory`] of each failing step.
+/// Re-probes both endpoints before refinement and rejects a contradictory bracket.
+/// The contract must succeed monotonically up to its ceiling: these checks detect
+/// observed inconsistencies, but cannot prove monotonicity at unprobed values.
 pub fn refine_upper_bound_audited<F>(
     mut low: u32,
     mut high: u32,
@@ -669,6 +679,21 @@ where
     if low >= high {
         return Err(CliError(format!(
             "refine_upper_bound requires lower bound ({low}) < upper bound ({high})"
+        )));
+    }
+
+    if !probe(low)?.succeeded() {
+        return Err(CliError(format!(
+            "non-monotonic probe results: lower bound {low} no longer succeeds; \
+             binary refinement requires a stable successful lower bound and failing upper bound; \
+             check contract validation and probe timeouts, then re-run"
+        )));
+    }
+    if probe(high)?.succeeded() {
+        return Err(CliError(format!(
+            "non-monotonic probe results: upper bound {high} now succeeds; \
+             binary refinement requires a stable successful lower bound and failing upper bound; \
+             check contract validation and probe timeouts, then re-run"
         )));
     }
 
@@ -1167,8 +1192,18 @@ fn load(
     function: &str,
     ramp: &str,
 ) -> Result<(Address, Env, ScSpecFunctionV0, usize), CliError> {
-    let wasm = std::fs::read(contract)
-        .map_err(|err| CliError(format!("failed to read {}: {err}", contract.display())))?;
+    let wasm = std::fs::read(contract).map_err(|err| {
+        let guidance = if err.kind() == std::io::ErrorKind::NotFound {
+            "contract file not found; check --contract (relative paths use the current directory) \
+             and build the contract successfully before retrying"
+        } else {
+            "check that --contract points to a readable .wasm file"
+        };
+        CliError(format!(
+            "failed to read {}: {err}; {guidance}",
+            contract.display()
+        ))
+    })?;
 
     let entries = soroban_spec::read::from_wasm(&wasm)
         .map_err(|err| CliError(format!("failed to read contract spec: {err}")))?;
@@ -1222,10 +1257,20 @@ fn load(
                 .iter()
                 .map(|p| p.name.to_utf8_string_lossy().to_string())
                 .collect();
+            let (available, guidance) = if param_names.is_empty() {
+                (
+                    "(none)".to_string(),
+                    "choose a function with a numeric, Bytes, or Vec parameter using --fn",
+                )
+            } else {
+                (
+                    param_names.join(", "),
+                    "set --ramp to an input name from the selected function's contract ABI",
+                )
+            };
             CliError(format!(
                 "{function:?} has no parameter named {ramp:?}; \
-                 available parameters: {}",
-                param_names.join(", ")
+                 available parameters: {available}; {guidance}"
             ))
         })?;
 
@@ -1593,6 +1638,69 @@ mod tests {
     }
 
     #[test]
+    fn ramp_steps_stop_at_the_cap_without_overflow() {
+        assert_eq!(next_ramp_value(1, SEARCH_UPPER_BOUND), Some(2));
+        assert_eq!(
+            next_ramp_value(SEARCH_UPPER_BOUND / 2, SEARCH_UPPER_BOUND),
+            Some(SEARCH_UPPER_BOUND)
+        );
+        assert_eq!(
+            next_ramp_value(SEARCH_UPPER_BOUND, SEARCH_UPPER_BOUND),
+            None
+        );
+        assert_eq!(next_ramp_value(8, 13), Some(13));
+        assert_eq!(next_ramp_value(u32::MAX / 2 + 1, u32::MAX), Some(u32::MAX));
+        assert_eq!(next_ramp_value(u32::MAX, u32::MAX), None);
+        assert_eq!(next_ramp_value(u32::MAX, SEARCH_UPPER_BOUND), None);
+    }
+
+    #[test]
+    fn refinement_rejects_changed_endpoints_before_probing_interior() {
+        for (lower_succeeds, upper_succeeds, expected, calls) in [
+            (false, false, "lower bound 8 no longer succeeds", vec![8]),
+            (true, true, "upper bound 32 now succeeds", vec![8, 32]),
+            (false, true, "lower bound 8 no longer succeeds", vec![8]),
+        ] {
+            let mut probed = Vec::new();
+            let err = refine_upper_bound(8, 32, &mut |value| {
+                probed.push(value);
+                Ok(if value == 8 {
+                    lower_succeeds
+                } else {
+                    upper_succeeds
+                })
+            })
+            .unwrap_err();
+            assert!(err.0.contains("non-monotonic probe results"), "{}", err.0);
+            assert!(err.0.contains(expected), "{}", err.0);
+            assert_eq!(probed, calls);
+        }
+    }
+
+    #[test]
+    fn refinement_validates_adjacent_bounds_and_handles_u32_max() {
+        let (low, high, audit) = refine_upper_bound_audited(u32::MAX - 1, u32::MAX, &mut |value| {
+            Ok(if value < u32::MAX {
+                ProbeOutcome::Succeeded
+            } else {
+                ProbeOutcome::Failed(ProbeFailureCategory::ExitFailure)
+            })
+        })
+        .unwrap();
+        assert_eq!((low, high), (u32::MAX - 1, u32::MAX));
+        assert!(audit.steps.is_empty());
+        let result = refine_upper_bound(1, u32::MAX, &mut |v| Ok(v < u32::MAX)).unwrap();
+        assert_eq!(result, (u32::MAX - 1, u32::MAX));
+    }
+
+    #[test]
+    fn refinement_preserves_probe_errors() {
+        let err = refine_upper_bound(1, 4, &mut |_| Err(CliError("cannot spawn probe".into())))
+            .unwrap_err();
+        assert_eq!(err.0, "cannot spawn probe");
+    }
+
+    #[test]
     fn binary_search_refines_to_adjacent_success_and_failure() {
         let mut probed = Vec::new();
         let (success, failure) = refine_upper_bound(8, 32, &mut |value| {
@@ -1601,7 +1709,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!((success, failure), (19, 20));
-        assert!(probed.len() <= 5);
+        assert_eq!(&probed[..2], &[8, 32]);
+        assert!(probed.len() <= 7);
     }
 
     // ---- #245: baseline comparison ----
@@ -2082,12 +2191,13 @@ mod tests {
         assert_eq!(audit.initial_high, 30);
         assert_eq!(audit.final_success, 23);
         assert_eq!(audit.final_failure, 24);
-        assert_eq!(audit.steps.len(), probed.len());
+        assert_eq!(&probed[..2], &[10, 30]);
+        assert_eq!(audit.steps.len(), probed.len() - 2);
 
         for (i, step) in audit.steps.iter().enumerate() {
             assert_eq!(step.step, i + 1);
-            assert_eq!(step.probe_value, probed[i]);
-            assert_eq!(step.succeeded, probed[i] <= 23);
+            assert_eq!(step.probe_value, probed[i + 2]);
+            assert_eq!(step.succeeded, step.probe_value <= 23);
             // Every failing step carries the standardized category; every
             // succeeding step carries none.
             assert_eq!(

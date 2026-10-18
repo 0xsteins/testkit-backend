@@ -4,8 +4,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand, ValueEnum};
+use proc_macro2::{Group, TokenStream, TokenTree};
 use quote::ToTokens;
 use serde::{Deserialize, Serialize};
+use syn::ext::IdentExt;
 use syn::visit::{self, Visit};
 use syn::{BinOp, Expr, FnArg, ImplItemFn, ItemFn, Local, Pat, Signature, Type, UnOp};
 use walkdir::WalkDir;
@@ -16,6 +18,57 @@ use super::CliError;
 /// declarative macros. Generated code requires separate inspection.
 pub const MACRO_SOURCE_LIMITATION: &str =
     "source-only scan: procedural macros and macro_rules! are not expanded; generated entry points and other generated code require separate inspection";
+
+/// How to read every finding this scanner emits. Each rule is a syntactic
+/// heuristic: a finding means the source matched a pattern, which is a
+/// signal for manual review — not a definitive defect report — and a
+/// missing finding is never a security guarantee.
+pub const FINDING_NATURE: &str =
+    "heuristic: each finding is a pattern-match signal for manual review, possibly a false positive; it is not a definitive defect report and a clean scan is not a security guarantee";
+
+/// Single mapping from a rule severity to a SARIF reporting level. Both the
+/// `rules` metadata and the `results` entries (and the `audit rules`
+/// machine-readable listing) route through this one function, so the
+/// severity shown in JSON and text can never disagree with the level SARIF
+/// consumers see.
+fn sarif_level(severity: &str) -> &'static str {
+    match severity {
+        "error" => "error",
+        "warning" => "warning",
+        _ => "note",
+    }
+}
+
+/// Rewrites a source line into a safe snippet: ANSI terminal escapes
+/// (e.g. `ESC[31m`) are removed and control characters collapse to a
+/// single space, so copying an arbitrary source line into a report cannot
+/// inject output or mangle the surrounding text.
+fn sanitize_snippet(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // Skip the rest of a CSI-style escape sequence (ESC [ params
+            // final-byte). Other ESC forms simply drop the escape byte.
+            if chars.peek() == Some(&'[') {
+                for skipped in chars.by_ref() {
+                    if skipped.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if c.is_control() {
+            if !out.ends_with(' ') {
+                out.push(' ');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.trim_end().to_string()
+}
 
 /// Arguments for `soroban-testkit audit`.
 #[derive(Args)]
@@ -31,10 +84,12 @@ pub struct AuditArgs {
     /// - `-`: read Rust source from stdin.
     ///
     /// While scanning a directory these are excluded (skipped, never
-    /// descended into): `target/`, `node_modules/`, and any hidden directory
-    /// (its name begins with `.`, e.g. `.git/`, `.github/`, `.cargo/`). A
+    /// descended into): `target/`, `vendor/`, `node_modules/`, and any hidden
+    /// directory (its name begins with `.`, e.g. `.git/`, `.github/`, `.cargo/`). A
     /// missing path is reported as an actionable error rather than an empty
-    /// "no findings" result.
+    /// "no findings" result. Explicitly selecting an excluded directory or
+    /// one of its files still scans that input. Empty Rust files are valid
+    /// and produce no findings.
     /// Findings and baseline entries use workspace-relative paths. Config is
     /// discovered from the source directory up to the workspace root (or
     /// from the current directory for stdin). Files that cannot be read or
@@ -104,9 +159,15 @@ fn default_enabled() -> bool {
 pub struct Finding {
     pub file: PathBuf,
     pub line: usize,
+    pub column: usize,
     pub rule: &'static str,
     pub severity: String,
     pub message: String,
+    /// The offending source line, filled from the file/stdin text when the
+    /// finding is created. Terminal escape sequences are stripped and
+    /// control characters collapsed at render time, so this field is
+    /// stored raw. `None` when no source text was available.
+    pub source_snippet: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,14 +210,22 @@ impl Finding {
 /// The supported scan roots are documented on `AuditArgs::path`: a
 /// directory is walked recursively for `.rs` files, a single `.rs` file is
 /// scanned directly, and `-` reads Rust source from stdin. Directory walks
-/// prune `target/`, `node_modules/`, and every hidden directory (a name
-/// beginning with `.`, such as `.git/` or `.github/`) via
+/// prune `target/`, `vendor/`, `node_modules/`, and every hidden directory
+/// (a name beginning with `.`, such as `.git/` or `.github/`) via
 /// `collect_rust_sources`, so build output and vendored/tooling trees are
 /// never audited. A non-existent root returns an actionable error naming the
 /// supported inputs instead of silently reporting "no findings".
 ///
 /// This source-only scan cannot inspect code generated by procedural macros
 /// or macro_rules!. Text, JSON and SARIF reports disclose that limitation.
+///
+/// Every finding is a syntactic pattern match, not proof of a defect
+/// ([`FINDING_NATURE`]). The heuristic nature is spelled out wherever users
+/// read reports: the closing `note` of text diagnostics, the `limitations`
+/// section of JSON and SARIF reports, the `audit rules` listing, and
+/// `audit explain <rule>`. Rule severities map to SARIF levels through one
+/// shared function (`sarif_level`), so text, JSON and SARIF can never
+/// disagree about the same finding.
 pub fn run(args: AuditArgs) -> Result<(), CliError> {
     match &args.command {
         Some(AuditCommand::Explain { rule }) => return explain_rule(rule),
@@ -259,7 +328,7 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
 /// These are build output and dependency/tooling trees that either generated
 /// non-contract Rust or would just slow the scan down; the audit is meant to
 /// run on hand-written contract source.
-pub const AUDIT_EXCLUDED_DIRS: &[&str] = &["target", "node_modules"];
+pub const AUDIT_EXCLUDED_DIRS: &[&str] = &["target", "vendor", "node_modules"];
 
 /// Prunes excluded directories during a walk. Returns `true` for the user's
 /// chosen root (even if it happens to share a name with an excluded
@@ -372,7 +441,10 @@ fn explain_rule(rule: &str) -> Result<(), CliError> {
         }
         _ => return Err(CliError(format!("unknown rule: {}", rule))),
     };
-    println!("{}", explanation);
+    // Every message above describes a syntactic pattern, not a proven
+    // defect: state the heuristic nature right next to the rule so the
+    // distinction between "flagged" and "broken" is never left to guesswork.
+    println!("{explanation}\n\nnote: {FINDING_NATURE}");
     Ok(())
 }
 
@@ -395,6 +467,7 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
             for (rule, severity, desc) in RULES {
                 println!("{rule:<40} {severity:<10} {desc}");
             }
+            println!("note: {FINDING_NATURE}");
             Ok(())
         }
         AuditOutputFormat::Json => {
@@ -412,7 +485,10 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
                 "tool": "soroban-testkit",
                 "version": 1,
                 "rules": rules,
-                "summary": { "rule_count": rules.len() },
+                "summary": {
+                    "rule_count": rules.len(),
+                    "limitations": [FINDING_NATURE]
+                },
             });
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
             Ok(())
@@ -426,10 +502,7 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
                         "shortDescription": { "text": id.replace('-', " ") },
                         "fullDescription": { "text": description },
                         "defaultConfiguration": {
-                            "level": match *severity {
-                                "error" => "error",
-                                _ => "warning",
-                            }
+                            "level": sarif_level(severity)
                         },
                     })
                 })
@@ -439,7 +512,8 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
                 "version": "2.1.0",
                 "runs": [{
                     "tool": { "driver": { "name": "soroban-testkit", "rules": rules } },
-                    "results": []
+                    "results": [],
+                    "properties": { "limitations": [FINDING_NATURE] }
                 }]
             });
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
@@ -481,9 +555,16 @@ impl<'a> DiagnosticRenderer<'a> {
     }
 
     /// Render compiler-style human-readable text diagnostics.
+    ///
+    /// Every finding carries the offending source line (`-->`), with ANSI
+    /// escape sequences stripped and control characters collapsed so a
+    /// copied snippet can never inject terminal output. Each finding is a
+    /// heuristic signal, spelled out in the closing note.
     pub fn render_text(&self) -> String {
         if self.findings.is_empty() {
-            return format!("audit: no findings\nnote: {MACRO_SOURCE_LIMITATION}\n");
+            return format!(
+                "audit: no findings\nnote: {MACRO_SOURCE_LIMITATION}\nnote: {FINDING_NATURE}\n"
+            );
         }
 
         let sorted = self.sorted_findings();
@@ -497,18 +578,25 @@ impl<'a> DiagnosticRenderer<'a> {
                 finding.rule,
                 finding.message
             ));
+            if let Some(snippet) = &finding.source_snippet {
+                output.push_str(&format!("    --> {}\n", sanitize_snippet(snippet)));
+            }
         }
         output.push_str(&format!(
             "\n{} finding(s). soroban-testkit audit is a linter with seven heuristics, not a \
              security product — a missing finding is not a security guarantee.\n",
             self.findings.len()
         ));
+        output.push_str(&format!("note: {FINDING_NATURE}\n"));
         output.push_str(&format!("note: {MACRO_SOURCE_LIMITATION}\n"));
         output
     }
 
-    /// Render stable, machine-readable JSON report.
+    /// Render stable, machine-readable JSON report. Source snippets are
+    /// sanitized before serialization so no terminal control sequence
+    /// survives transport.
     pub fn render_json(&self) -> Result<String, CliError> {
+ feat/audit-hardening-437-431-430-429
         let sorted = self.sorted_findings();
         serde_json::to_string_pretty(&serde_json::json!({
             "tool": "soroban-testkit",
@@ -517,6 +605,27 @@ impl<'a> DiagnosticRenderer<'a> {
             "summary": {
                 "finding_count": sorted.len(),
                 "limitations": [MACRO_SOURCE_LIMITATION]
+
+        let findings: Vec<_> = self
+            .findings
+            .iter()
+            .map(|finding| {
+                let mut value = serde_json::to_value(finding)
+                    .expect("finding serializes despite sanitized snippet");
+                if let Some(snippet) = &finding.source_snippet {
+                    value["source_snippet"] = serde_json::Value::String(sanitize_snippet(snippet));
+                }
+                value
+            })
+            .collect();
+        serde_json::to_string_pretty(&serde_json::json!({
+            "tool": "soroban-testkit",
+            "version": 1,
+            "findings": findings,
+            "summary": {
+                "finding_count": self.findings.len(),
+                "limitations": [MACRO_SOURCE_LIMITATION, FINDING_NATURE]
+ main
             }
         }))
         .map(|report| format!("{report}\n"))
@@ -524,6 +633,11 @@ impl<'a> DiagnosticRenderer<'a> {
     }
 
     /// Render SARIF 2.1.0 output for code scanning integration.
+    ///
+    /// Rule metadata and result levels both map through [`sarif_level`], so
+    /// a severity shown in the `rules` section can never disagree with the
+    /// `level` on its `results`. Region snippets are sanitized before
+    /// embedding.
     pub fn render_sarif(&self) -> Result<String, CliError> {
         let sorted = self.sorted_findings();
         let mut rule_ids: Vec<_> = sorted.iter().map(|finding| finding.rule).collect();
@@ -536,6 +650,22 @@ impl<'a> DiagnosticRenderer<'a> {
                     .iter()
                     .find(|(id, _, _)| *id == rule)
                     .map(|(_, _, desc)| *desc);
+                // The metadata level mirrors the level this scan gives the
+                // rule's findings: a config override takes effect, and with
+                // nothing configured the `RULES` default applies — both walk
+                // through the shared `sarif_level` mapping, so the metadata
+                // level always matches how `results` display the same rule.
+                let effective_severity = self
+                    .findings
+                    .iter()
+                    .find(|finding| finding.rule == rule)
+                    .map(|finding| finding.severity.as_str())
+                    .or_else(|| {
+                        RULES
+                            .iter()
+                            .find(|(id, _, _)| *id == rule)
+                            .map(|(_, severity, _)| *severity)
+                    });
                 let mut rule_obj = serde_json::json!({
                     "id": rule,
                     "shortDescription": { "text": rule.replace('-', " ") }
@@ -543,25 +673,31 @@ impl<'a> DiagnosticRenderer<'a> {
                 if let Some(desc) = description {
                     rule_obj["fullDescription"] = serde_json::json!({ "text": desc });
                 }
+                if let Some(severity) = effective_severity {
+                    rule_obj["defaultConfiguration"] =
+                        serde_json::json!({ "level": sarif_level(severity) });
+                }
                 rule_obj
             })
             .collect();
         let results: Vec<_> = sorted
             .iter()
             .map(|finding| {
-                let level = match finding.severity.as_str() {
-                    "error" => "error",
-                    "warning" => "warning",
-                    _ => "note",
+                let region = match &finding.source_snippet {
+                    Some(snippet) => serde_json::json!({
+                        "startLine": finding.line.max(1),
+                        "snippet": { "text": sanitize_snippet(snippet) }
+                    }),
+                    None => serde_json::json!({ "startLine": finding.line.max(1) }),
                 };
                 serde_json::json!({
                     "ruleId": finding.rule,
-                    "level": level,
+                    "level": sarif_level(&finding.severity),
                     "message": { "text": finding.message },
                     "locations": [{
                         "physicalLocation": {
                             "artifactLocation": { "uri": finding.file.to_string_lossy() },
-                            "region": { "startLine": finding.line.max(1) }
+                            "region": region
                         }
                     }]
                 })
@@ -573,7 +709,7 @@ impl<'a> DiagnosticRenderer<'a> {
             "runs": [{
                 "tool": { "driver": { "name": "soroban-testkit", "rules": rules } },
                 "results": results,
-                "properties": { "limitations": [MACRO_SOURCE_LIMITATION] }
+                "properties": { "limitations": [MACRO_SOURCE_LIMITATION, FINDING_NATURE] }
             }]
         }))
         .map(|report| format!("{report}\n"))
@@ -708,15 +844,43 @@ fn audit_source(
     })?;
 
     let suppressions = extract_suppressions(full_src);
+    let source_lines = SourceLines::new(full_src);
 
     let mut visitor = FunctionVisitor {
         path: path.to_path_buf(),
         findings,
         config,
         suppressions: &suppressions,
+        source: &source_lines,
+        current_column: 1,
     };
     visitor.visit_file(&file);
+    findings.sort_by(|left, right| left.file.cmp(&right.file).then(left.line.cmp(&right.line)).then(left.column.cmp(&right.column)).then(left.rule.cmp(right.rule)));
+    findings.dedup_by(|left, right| left.file == right.file && left.line == right.line && left.column == right.column && left.rule == right.rule);
     Ok(())
+}
+
+/// Line-indexed view of the scanned source, used to attach the offending
+/// line to each finding. Lines are stored exactly as written off disk or
+/// stdin; sanitizing (ANSI/control-character stripping) happens at render
+/// time so the stored form can still round-trip in tests of the renderer.
+pub struct SourceLines(Vec<String>);
+
+impl SourceLines {
+    fn new(src: &str) -> Self {
+        Self(src.lines().map(str::to_string).collect())
+    }
+
+    /// 1-based accessor matching compiler-style line numbers. Returns
+    /// `None` for line 0 (when token spans are unavailable) or any line
+    /// past the end of the file.
+    pub fn get(&self, line: usize) -> Option<&String> {
+        self.0.get(line.checked_sub(1)?)
+    }
+
+    fn column(&self, line: usize, byte_column: usize) -> usize {
+        self.get(line).map(|source| source[..byte_column.min(source.len())].chars().count() + 1).unwrap_or(1)
+    }
 }
 
 struct Suppression {
@@ -971,10 +1135,13 @@ struct FunctionVisitor<'a> {
     findings: &'a mut Vec<Finding>,
     config: &'a AuditConfig,
     suppressions: &'a [Suppression],
+    source: &'a SourceLines,
+    current_column: usize,
 }
 
 impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
+ feat/audit-hardening-437-431-430-429
         let line = line_of(node);
         let fn_range = item_line_range(node);
         let fn_name = node.sig.ident.to_string();
@@ -983,10 +1150,20 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
         self.audit_i128_arithmetic(&node.sig, &node.block, line, fn_range);
         self.audit_ignored_transfer_results(&node.sig, &node.block, fn_range);
         self.audit_mock_all_auths(&body_src, line, &fn_name, fn_range);
+
+        let (line, column) = position_of(node, self.source);
+        self.current_column = column;
+        let fn_name = node.sig.ident.to_string();
+        let body_src = normalized_tokens(node.to_token_stream()).to_string();
+        self.audit_function(&node.sig, &node.block, body_src.clone(), line);
+        self.audit_i128_arithmetic(&node.sig, &node.block, line);
+        self.audit_ignored_transfer_results(&node.sig, &node.block);
+        self.audit_mock_all_auths(&node.block, line, &fn_name);
+ main
         visit::visit_item_fn(self, node);
     }
 
-    fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
+    fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) { feat/audit-hardening-437-431-430-429
         let line = line_of(node);
         let fn_range = item_line_range(node);
         let fn_name = node.sig.ident.to_string();
@@ -995,8 +1172,36 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
         self.audit_i128_arithmetic(&node.sig, &node.block, line, fn_range);
         self.audit_ignored_transfer_results(&node.sig, &node.block, fn_range);
         self.audit_mock_all_auths(&body_src, line, &fn_name, fn_range);
+
+        let (line, column) = position_of(node, self.source);
+        self.current_column = column;
+        let fn_name = node.sig.ident.to_string();
+        let body_src = normalized_tokens(node.to_token_stream()).to_string();
+        self.audit_function(&node.sig, &node.block, body_src.clone(), line);
+        self.audit_i128_arithmetic(&node.sig, &node.block, line);
+        self.audit_ignored_transfer_results(&node.sig, &node.block);
+        self.audit_mock_all_auths(&node.block, line, &fn_name);
+ main
         visit::visit_impl_item_fn(self, node);
     }
+}
+
+// Raw spelling does not change an identifier's meaning. Normalize identifiers
+// for the token-based heuristics without altering literals or source spans.
+fn normalized_tokens(tokens: TokenStream) -> TokenStream {
+    tokens
+        .into_iter()
+        .map(|token| match token {
+            TokenTree::Ident(ident) => TokenTree::Ident(ident.unraw()),
+            TokenTree::Group(group) => {
+                let mut normalized =
+                    Group::new(group.delimiter(), normalized_tokens(group.stream()));
+                normalized.set_span(group.span());
+                TokenTree::Group(normalized)
+            }
+            other => other,
+        })
+        .collect()
 }
 
 impl FunctionVisitor<'_> {
@@ -1013,8 +1218,13 @@ impl FunctionVisitor<'_> {
         // Rule 1: an Address parameter that's never checked with require_auth.
         if self.is_enabled("missing-require-auth") {
             let address_params = address_typed_params(sig);
+ feat/audit-hardening-437-431-430-429
             if !address_params.is_empty() && !has_enforced_require_auth(block) {
                 self.push_with_range(
+
+            if !address_params.is_empty() && !contains_method_call(block, "require_auth") {
+                self.push(
+ main
                     line,
                     "missing-require-auth",
                     "warning",
@@ -1092,6 +1302,7 @@ impl FunctionVisitor<'_> {
         }
     }
 
+ feat/audit-hardening-437-431-430-429
     fn audit_mock_all_auths(
         &mut self,
         body_src: &str,
@@ -1099,17 +1310,25 @@ impl FunctionVisitor<'_> {
         fn_name: &str,
         fn_range: (usize, usize),
     ) {
+
+    fn audit_mock_all_auths(&mut self, block: &syn::Block, line: usize, fn_name: &str) {
+ main
         if !self.is_enabled("broad-mock-all-auths") {
             return;
         }
 
-        let is_test = fn_name.contains("test") || body_src.contains("#[test]");
+        let is_test = fn_name.contains("test");
         if !is_test {
             return;
         }
 
+ feat/audit-hardening-437-431-430-429
         if body_src.contains("mock_all_auths") {
             self.push_with_range(
+
+        if contains_method_call(block, "mock_all_auths") {
+            self.push(
+ main
                 line,
                 "broad-mock-all-auths",
                 "warning",
@@ -1163,12 +1382,20 @@ impl FunctionVisitor<'_> {
             .and_then(|r| r.severity.as_deref())
             .unwrap_or(default_severity);
 
+        // Attach the offending source line before any render step, so every
+        // output format gets the same verified context. Lines that carry
+        // ANSI codes or control characters stay in this raw form on the
+        // struct; sanitizing happens in the renderer.
+        let source_snippet = self.source.get(line).cloned();
+
         self.findings.push(Finding {
             file: self.path.clone(),
             line,
+            column: self.current_column,
             rule,
             severity: severity.to_string(),
             message,
+            source_snippet,
         });
     }
 
@@ -1188,7 +1415,7 @@ impl FunctionVisitor<'_> {
             if let FnArg::Typed(pat_type) = arg {
                 if type_is_i128(&pat_type.ty) {
                     if let Pat::Ident(ident) = &*pat_type.pat {
-                        i128_bindings.insert(ident.ident.to_string());
+                        i128_bindings.insert(ident.ident.unraw().to_string());
                     }
                 }
             }
@@ -1203,6 +1430,7 @@ impl FunctionVisitor<'_> {
             findings: self.findings,
             config: self.config,
             suppressions: self.suppressions,
+            source: self.source,
         };
         visitor.visit_block(body);
     }
@@ -1224,6 +1452,7 @@ impl FunctionVisitor<'_> {
             findings: self.findings,
             config: self.config,
             suppressions: self.suppressions,
+            source: self.source,
         };
         visitor.visit_block(body);
     }
@@ -1236,7 +1465,7 @@ fn signed_amount_params(sig: &Signature) -> Vec<String> {
             FnArg::Typed(pat_type) if type_is_signed_integer(&pat_type.ty) => {
                 match &*pat_type.pat {
                     Pat::Ident(ident) if ident.ident.to_string().contains("amount") => {
-                        Some(ident.ident.to_string())
+                        Some(ident.ident.unraw().to_string())
                     }
                     _ => None,
                 }
@@ -1251,7 +1480,7 @@ fn type_is_signed_integer(ty: &Type) -> bool {
         Type::Reference(reference) => type_is_signed_integer(&reference.elem),
         Type::Path(path) => path.path.get_ident().is_some_and(|ident| {
             matches!(
-                ident.to_string().as_str(),
+                ident.unraw().to_string().as_str(),
                 "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
             )
         }),
@@ -1296,17 +1525,33 @@ fn type_is_address(ty: &Type) -> bool {
             .path
             .segments
             .last()
-            .is_some_and(|seg| seg.ident == "Address"),
+            .is_some_and(|seg| seg.ident.unraw() == "Address"),
         _ => false,
     }
 }
 
-fn line_of(node: impl quote::ToTokens) -> usize {
+fn position_of(node: impl quote::ToTokens, source: &SourceLines) -> (usize, usize) {
     node.to_token_stream()
         .into_iter()
         .next()
-        .map(|t| t.span().start().line)
-        .unwrap_or(0)
+        .map(|token| {
+            let start = token.span().start();
+            (start.line, source.column(start.line, start.column))
+        })
+        .unwrap_or((0, 1))
+}
+
+fn contains_method_call(block: &syn::Block, method: &str) -> bool {
+    struct MethodCallVisitor<'a> { method: &'a str, found: bool }
+    impl<'ast> Visit<'ast> for MethodCallVisitor<'_> {
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            if node.method == self.method { self.found = true; }
+            visit::visit_expr_method_call(self, node);
+        }
+    }
+    let mut visitor = MethodCallVisitor { method, found: false };
+    visitor.visit_block(block);
+    visitor.found
 }
 
 struct IgnoredTransferVisitor<'a> {
@@ -1316,6 +1561,8 @@ struct IgnoredTransferVisitor<'a> {
     findings: &'a mut Vec<Finding>,
     config: &'a AuditConfig,
     suppressions: &'a [Suppression],
+    source: &'a SourceLines,
+    current_column: usize,
 }
 
 impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
@@ -1335,6 +1582,7 @@ impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
         };
 
         if let Some(expr) = ignored_call {
+ feat/audit-hardening-437-431-430-429
             let line = line_of(expr);
             let is_suppressed = is_finding_suppressed(
                 self.suppressions,
@@ -1342,6 +1590,15 @@ impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
                 line,
                 Some(self.fn_range),
             );
+
+            let (line, column) = position_of(expr, self.source);
+            let is_suppressed = self.suppressions.iter().any(|s| {
+                (s.line == line || s.line == line - 1)
+                    && (s.rules.contains(&"*".to_string())
+                        || s.rules
+                            .contains(&"ignored-token-transfer-result".to_string()))
+            });
+ main
 
             if !is_suppressed {
                 let severity = self
@@ -1360,6 +1617,7 @@ impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
                         "fn {} ignores the result of token `{method}`; propagate, match, or bind the result",
                         self.fn_name
                     ),
+                    source_snippet: self.source.get(line).cloned(),
                 });
             }
         }
@@ -1372,11 +1630,11 @@ fn transfer_method_name(expr: &Expr) -> Option<&'static str> {
     match expr {
         Expr::MethodCall(call)
             if matches!(
-                call.method.to_string().as_str(),
+                call.method.unraw().to_string().as_str(),
                 "transfer" | "transfer_from" | "try_transfer" | "try_transfer_from"
             ) =>
         {
-            Some(match call.method.to_string().as_str() {
+            Some(match call.method.unraw().to_string().as_str() {
                 "transfer_from" => "transfer_from",
                 "try_transfer" => "try_transfer",
                 "try_transfer_from" => "try_transfer_from",
@@ -1405,11 +1663,17 @@ struct I128ArithmeticVisitor<'a> {
     path: PathBuf,
     fn_name: String,
     fn_line: usize,
+ feat/audit-hardening-437-431-430-429
     fn_range: (usize, usize),
+
+    fn_column: usize,
+ main
     i128_bindings: HashSet<String>,
     findings: &'a mut Vec<Finding>,
     config: &'a AuditConfig,
     suppressions: &'a [Suppression],
+    source: &'a SourceLines,
+    current_column: usize,
 }
 
 impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
@@ -1417,7 +1681,7 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
         if let Pat::Type(pat_type) = &node.pat {
             if type_is_i128(&pat_type.ty) {
                 if let Pat::Ident(ident) = &*pat_type.pat {
-                    self.i128_bindings.insert(ident.ident.to_string());
+                    self.i128_bindings.insert(ident.ident.unraw().to_string());
                 }
             }
         }
@@ -1448,11 +1712,16 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
 
                 self.findings.push(Finding {
                     file: self.path.clone(),
+ feat/audit-hardening-437-431-430-429
                     line: if expr_line > 0 {
                         expr_line
                     } else {
                         self.fn_line
                     },
+
+                    line: self.fn_line,
+                    column: self.fn_column,
+                  main
                     rule: "unchecked-i128-arithmetic",
                     severity: severity.to_string(),
                     message: format!(
@@ -1460,6 +1729,7 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
                          wrapping_ variants to avoid silent overflow",
                         self.fn_name
                     ),
+                    source_snippet: self.source.get(self.fn_line).cloned(),
                 });
             }
         }
@@ -1473,7 +1743,7 @@ impl I128ArithmeticVisitor<'_> {
             Expr::Path(p) => p
                 .path
                 .get_ident()
-                .is_some_and(|ident| self.i128_bindings.contains(&ident.to_string())),
+                .is_some_and(|ident| self.i128_bindings.contains(&ident.unraw().to_string())),
             Expr::Lit(lit) => matches!(&lit.lit, syn::Lit::Int(i) if i.suffix() == "i128"),
             Expr::Paren(p) => self.touches_i128(&p.expr),
             Expr::Group(g) => self.touches_i128(&g.expr),
@@ -1483,7 +1753,7 @@ impl I128ArithmeticVisitor<'_> {
 }
 
 fn type_is_i128(ty: &Type) -> bool {
-    matches!(ty, Type::Path(p) if p.path.is_ident("i128"))
+    matches!(ty, Type::Path(p) if p.path.get_ident().is_some_and(|ident| ident.unraw() == "i128"))
 }
 
 #[cfg(test)]
@@ -1500,6 +1770,25 @@ mod tests {
             source,
         )
         .unwrap();
+        findings
+    }
+
+    /// Runs the [`FunctionVisitor`] over `code` once; the handful of
+    /// visitor-level tests share it so a visitor change cannot silently
+    /// update five different call sites.
+    fn unit_findings(code: &str, config: &AuditConfig) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        let file = syn::parse_file(code).unwrap();
+        let suppressions = Vec::new();
+        let source_lines = SourceLines::new(code);
+        let mut visitor = FunctionVisitor {
+            path: PathBuf::from("test.rs"),
+            findings: &mut findings,
+            config,
+            suppressions: &suppressions,
+            source: &source_lines,
+        };
+        visitor.visit_file(&file);
         findings
     }
 
@@ -1583,66 +1872,39 @@ mod tests {
 
     #[test]
     fn test_missing_require_auth_detected() {
-        let mut findings = Vec::new();
-        let config = AuditConfig::default();
-
-        let code = r#"
+        let findings = unit_findings(
+            r#"
             pub fn withdraw(env: &Env, caller: &Address, amount: i128) {
                 env.storage().persistent().set(&"amount", &amount);
             }
-        "#;
-
-        let file = syn::parse_file(code).unwrap();
-        let suppressions = Vec::new();
-        let mut visitor = FunctionVisitor {
-            path: PathBuf::from("test.rs"),
-            findings: &mut findings,
-            config: &config,
-            suppressions: &suppressions,
-        };
-        visitor.visit_file(&file);
-
+        "#,
+            &AuditConfig::default(),
+        );
         assert!(!findings.is_empty());
         assert_eq!(findings[0].rule, "missing-require-auth");
     }
 
     #[test]
     fn test_mock_all_auths_detected() {
-        let mut findings = Vec::new();
-        let config = AuditConfig::default();
-
-        let code = r#"
+        let findings = unit_findings(
+            r#"
             #[test]
             fn test_broad_auth() {
                 let env = Env::default();
                 env.mock_all_auths();
                 env.invoke_contract(&contract, &Symbol::new(&env, "transfer"), &args);
             }
-        "#;
-
-        let file = syn::parse_file(code).unwrap();
-        let suppressions = Vec::new();
-        let mut visitor = FunctionVisitor {
-            path: PathBuf::from("test.rs"),
-            findings: &mut findings,
-            config: &config,
-            suppressions: &suppressions,
-        };
-        visitor.visit_file(&file);
-
-        let mock_findings: Vec<_> = findings
-            .iter()
-            .filter(|f| f.rule == "broad-mock-all-auths")
-            .collect();
+        "#,
+            &AuditConfig::default(),
+        );
         assert!(
-            !mock_findings.is_empty(),
+            findings.iter().any(|f| f.rule == "broad-mock-all-auths"),
             "Expected to find broad-mock-all-auths finding"
         );
     }
 
     #[test]
     fn test_rule_disabled_skips_check() {
-        let mut findings = Vec::new();
         let mut rules = HashMap::new();
         rules.insert(
             "missing-require-auth".to_string(),
@@ -1652,36 +1914,22 @@ mod tests {
             },
         );
         let config = AuditConfig { rules };
-
-        let code = r#"
+        let findings = unit_findings(
+            r#"
             pub fn withdraw(env: &Env, caller: &Address, amount: i128) {
                 env.storage().persistent().set(&"amount", &amount);
             }
-        "#;
-
-        let file = syn::parse_file(code).unwrap();
-        let suppressions = Vec::new();
-        let mut visitor = FunctionVisitor {
-            path: PathBuf::from("test.rs"),
-            findings: &mut findings,
-            config: &config,
-            suppressions: &suppressions,
-        };
-        visitor.visit_file(&file);
-
-        let require_auth_findings: Vec<_> = findings
-            .iter()
-            .filter(|f| f.rule == "missing-require-auth")
-            .collect();
+        "#,
+            &config,
+        );
         assert!(
-            require_auth_findings.is_empty(),
+            findings.iter().all(|f| f.rule != "missing-require-auth"),
             "Expected no missing-require-auth findings when disabled"
         );
     }
 
     #[test]
     fn test_severity_override_applied() {
-        let mut findings = Vec::new();
         let mut rules = HashMap::new();
         rules.insert(
             "missing-require-auth".to_string(),
@@ -1691,23 +1939,14 @@ mod tests {
             },
         );
         let config = AuditConfig { rules };
-
-        let code = r#"
+        let findings = unit_findings(
+            r#"
             pub fn withdraw(env: &Env, caller: &Address, amount: i128) {
                 env.storage().persistent().set(&"amount", &amount);
             }
-        "#;
-
-        let file = syn::parse_file(code).unwrap();
-        let suppressions = Vec::new();
-        let mut visitor = FunctionVisitor {
-            path: PathBuf::from("test.rs"),
-            findings: &mut findings,
-            config: &config,
-            suppressions: &suppressions,
-        };
-        visitor.visit_file(&file);
-
+        "#,
+            &config,
+        );
         let auth_findings: Vec<_> = findings
             .iter()
             .filter(|f| f.rule == "missing-require-auth")
@@ -1718,30 +1957,18 @@ mod tests {
 
     #[test]
     fn test_i128_arithmetic_detection() {
-        let mut findings = Vec::new();
-        let config = AuditConfig::default();
-
-        let code = r#"
+        let findings = unit_findings(
+            r#"
             pub fn calculate(amount: i128) -> i128 {
                 amount + 100
             }
-        "#;
-
-        let file = syn::parse_file(code).unwrap();
-        let suppressions = Vec::new();
-        let mut visitor = FunctionVisitor {
-            path: PathBuf::from("test.rs"),
-            findings: &mut findings,
-            config: &config,
-            suppressions: &suppressions,
-        };
-        visitor.visit_file(&file);
-
-        let arith_findings: Vec<_> = findings
-            .iter()
-            .filter(|f| f.rule == "unchecked-i128-arithmetic")
-            .collect();
-        assert!(!arith_findings.is_empty());
+        "#,
+            &AuditConfig::default(),
+        );
+        assert!(
+            findings.iter().any(|f| f.rule == "unchecked-i128-arithmetic"),
+            "Expected to find unchecked-i128-arithmetic finding"
+        );
     }
 
     #[test]
@@ -1840,9 +2067,11 @@ mod tests {
         let findings = [Finding {
             file: PathBuf::from(&value),
             line: 1,
+            column: 1,
             rule: "missing-require-auth",
             severity: value.clone(),
             message: value.clone(),
+            source_snippet: None,
         }];
         let output = render_findings(&findings, AuditOutputFormat::Json).unwrap();
         let report: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -1915,6 +2144,7 @@ mod tests {
         assert!(err.0.contains("stdin"), "{}", err.0);
     }
 
+ feat/audit-hardening-437-431-430-429
     // ---- #437: avoid counting suppressed findings toward strict exit status ----
 
     #[test]
@@ -2216,5 +2446,121 @@ mod tests {
         let z_pos = text1.find("src/z.rs:50").unwrap();
         assert!(a_auth_pos < a_ttl_pos);
         assert!(a_ttl_pos < z_pos);
+
+    // ---- #482: findings disclose when they are heuristic, not definitive ----
+
+    #[test]
+    fn rendered_outputs_document_the_heuristic_nature_of_findings() {
+        let findings = audit_source_for_test("pub fn deposit(amount: i128) { save(amount); }");
+        let text = render_findings(&findings, AuditOutputFormat::Text).unwrap();
+        assert!(text.contains("note: heuristic"), "{text}");
+
+        let json = render_findings(&findings, AuditOutputFormat::Json).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let limitations = report["summary"]["limitations"].as_array().unwrap();
+        assert!(
+            limitations
+                .iter()
+                .any(|l| l.as_str().unwrap().contains("heuristic")),
+            "{limitations:?}"
+        );
+
+        let sarif = render_findings(&findings, AuditOutputFormat::Sarif).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&sarif).unwrap();
+        let limitations = report["runs"][0]["properties"]["limitations"].as_array().unwrap();
+        assert!(
+            limitations
+                .iter()
+                .any(|l| l.as_str().unwrap().contains("heuristic")),
+            "{limitations:?}"
+        );
+    }
+
+    #[test]
+    fn clean_reports_still_disclose_the_heuristic_limitation() {
+        let text = render_text(&[]);
+        assert!(text.contains("audit: no findings"), "{text}");
+        assert!(text.contains("macro_rules!"), "{text}");
+        assert!(text.contains("heuristic"), "{text}");
+    }
+
+    // ---- #483: severity mapping is identical across output formats ----
+
+    #[test]
+    fn sarif_level_mapping_is_total_and_shared() {
+        assert_eq!(sarif_level("error"), "error");
+        assert_eq!(sarif_level("warning"), "warning");
+        assert_eq!(sarif_level("note"), "note");
+        assert_eq!(sarif_level(""), "note");
+        assert_eq!(sarif_level("critical"), "note");
+    }
+
+    #[test]
+    fn rule_metadata_and_results_agree_for_unconfigured_rules() {
+        let findings = audit_source_for_test("pub fn deposit(amount: i128) { save(amount); }");
+        for severity in findings.iter().map(|f| f.severity.as_str()) {
+            assert_eq!(severity, "warning");
+            assert_eq!(sarif_level(severity), "warning");
+        }
+    }
+
+    // ---- #484: source snippets without terminal control sequences ----
+
+    #[test]
+    fn text_and_json_render_snippets_that_stripped_terminal_escapes() {
+        let source = "pub fn deposit(env: &Env, from: &Address, amount: i128) { \
+                      save(from, amount); } // \u{1b}[31mbold\u{1b}[0m";
+        let findings = audit_source_for_test(source);
+
+        let text = render_findings(&findings, AuditOutputFormat::Text).unwrap();
+        assert!(
+            text.contains("    --> pub fn deposit(env: &Env, from: &Address, amount: i128)"),
+            "{text}"
+        );
+        assert!(text.contains("// bold"), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text}");
+
+        let json = render_findings(&findings, AuditOutputFormat::Json).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            report["findings"][0]["source_snippet"],
+            "pub fn deposit(env: &Env, from: &Address, amount: i128) { save(from, amount); } // bold"
+        );
+    }
+
+    #[test]
+    fn snippets_sanitize_without_losing_surrounding_text() {
+        // Tab, BEL and DEL collapse; CSI sequences disappear entirely.
+        let dirty = "let x = 1;\t\u{7}let y = 2;\u{7f}";
+        let clean = sanitize_snippet(dirty);
+        assert_eq!(clean, "let x = 1; let y = 2;");
+        assert!(!clean.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn sarif_region_snippets_carry_only_printable_text() {
+        let findings = audit_source_for_test("pub fn deposit(amount: i128) { save(amount); }");
+        let sarif = render_findings(&findings, AuditOutputFormat::Sarif).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&sarif).unwrap();
+        let snippet = report["runs"][0]["results"][0]["locations"][0]["physicalLocation"]
+            ["region"]["snippet"]["text"]
+            .as_str()
+            .unwrap();
+        assert_eq!(snippet, "pub fn deposit(amount: i128) { save(amount); }");
+        assert!(!snippet.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn snippets_match_the_reported_line_across_rules() {
+        let source =
+            "pub fn tokenbridge(token: TokenClient) { token.transfer(); token.transfer_from(); }";
+        let findings = audit_source_for_test(source);
+        for finding in findings
+            .iter()
+            .filter(|f| f.rule == "ignored-token-transfer-result")
+        {
+            assert_eq!(finding.source_snippet.as_deref(), Some(source));
+        }
+ main
     }
 }
