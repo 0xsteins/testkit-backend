@@ -655,11 +655,11 @@ mod tests {
         let env = TestEnv::with_seed(99);
         let reference = TestEnv::with_seed(99);
 
-        let _t0 = env.token();           // token before first address
+        let _t0 = env.token(); // token before first address
         let a1 = env.address();
-        let _t1 = env.token();           // token between addresses
+        let _t1 = env.token(); // token between addresses
         let a2 = env.address();
-        let _t2 = env.token();           // token after second address
+        let _t2 = env.token(); // token after second address
 
         let r1 = reference.address();
         let r2 = reference.address();
@@ -681,9 +681,6 @@ mod tests {
 
         let ref_batch = reference.addresses(4);
 
-        assert_eq!(
-            batch, ref_batch,
-            "batch shifted by preceding token() calls"
-        );
+        assert_eq!(batch, ref_batch, "batch shifted by preceding token() calls");
     }
 }

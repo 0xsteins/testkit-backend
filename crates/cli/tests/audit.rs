@@ -811,7 +811,6 @@ fn audit_stdin_discovers_config_from_the_current_workspace() {
     assert_eq!(report["summary"]["finding_count"], 0);
 }
 
- feat/audit-hardening-437-431-430-429
 #[test]
 fn audit_strict_mode_exits_zero_when_findings_are_suppressed() {
     let root = std::env::temp_dir().join(format!(
@@ -943,6 +942,7 @@ fn audit_runs_are_byte_for_byte_deterministic_across_repeated_invocations() {
     }
 
     let _ = std::fs::remove_dir_all(&root);
+}
 
 // ---- #481: focused fixtures, one per supported Rust syntax form ----
 
@@ -1041,7 +1041,10 @@ fn audit_explain_rules_document_the_heuristic_nature_of_findings() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains(rule), "{stdout}");
         assert!(stdout.contains("heuristic"), "{stdout}");
-        assert!(stdout.contains("not a definitive defect report"), "{stdout}");
+        assert!(
+            stdout.contains("not a definitive defect report"),
+            "{stdout}"
+        );
     }
 }
 
@@ -1071,7 +1074,8 @@ fn audit_rules_listing_documents_the_heuristic_nature_of_findings() {
 fn audit_sarif_levels_match_the_severity_shown_in_text_and_json() {
     let fixture = AuditFixture::new("severity-consistency");
     fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
-    for (configured, sarif_level) in [("warning", "warning"), ("error", "error"), ("note", "note")] {
+    for (configured, sarif_level) in [("warning", "warning"), ("error", "error"), ("note", "note")]
+    {
         fixture.write(
             ".soroban-testkit.toml",
             format!("[rules.missing-require-auth]\nseverity = '{configured}'\n"),
@@ -1089,7 +1093,10 @@ fn audit_sarif_levels_match_the_severity_shown_in_text_and_json() {
         let sarif = fixture.scan(&["--format", "sarif"]);
         assert!(sarif.status.success());
         let report: serde_json::Value = serde_json::from_slice(&sarif.stdout).unwrap();
-        assert_eq!(report["runs"][0]["results"][0]["level"], sarif_level, "{report}");
+        assert_eq!(
+            report["runs"][0]["results"][0]["level"], sarif_level,
+            "{report}"
+        );
         assert_eq!(
             report["runs"][0]["tool"]["driver"]["rules"][0]["defaultConfiguration"]["level"],
             sarif_level,
@@ -1112,7 +1119,8 @@ fn audit_reports_source_snippets_without_leaking_terminal_control_sequences() {
     assert!(text.status.success());
     let stdout = String::from_utf8_lossy(&text.stdout);
     assert!(
-        stdout.contains("    --> pub fn withdraw(env: Env, from: Address) { let _ = &from; } // red"),
+        stdout
+            .contains("    --> pub fn withdraw(env: Env, from: Address) { let _ = &from; } // red"),
         "{stdout}"
     );
     assert!(!stdout.contains('\u{1b}'), "{stdout}");
@@ -1133,7 +1141,6 @@ fn audit_reports_source_snippets_without_leaking_terminal_control_sequences() {
             ["text"],
         "pub fn withdraw(env: Env, from: Address) { let _ = &from; } // red"
     );
- main
 }
 
 // ---- #485: findings sort by file, line, rule, and message ----
@@ -1231,7 +1238,10 @@ fn audit_reports_parse_warnings_on_stderr_and_findings_in_the_report() {
         stderr.contains("audit: warning: failed to parse Rust source"),
         "{stderr}"
     );
-    assert!(stderr.contains("parse warnings are not findings"), "{stderr}");
+    assert!(
+        stderr.contains("parse warnings are not findings"),
+        "{stderr}"
+    );
     assert!(
         stderr.contains("audit incomplete: 1 parse warning(s)"),
         "{stderr}"
@@ -1257,7 +1267,10 @@ fn audit_parse_warnings_fail_the_run_without_acting_like_strict_findings() {
         stderr.contains("audit incomplete: 1 parse warning(s)"),
         "{stderr}"
     );
-    assert!(stderr.contains("parse warnings are not findings"), "{stderr}");
+    assert!(
+        stderr.contains("parse warnings are not findings"),
+        "{stderr}"
+    );
     // No heuristic finding existed, so the strict-failure wording must not
     // appear: parse warnings never reach --strict.
     assert!(!stderr.contains("audit finding(s)"), "{stderr}");
@@ -1338,4 +1351,126 @@ fn audit_clean_report_is_snapshotted_in_both_modes() {
             "clean-report snapshot changed for {args:?}"
         );
     }
+}
+
+// #436: Unix paths may contain non-UTF-8 bytes; text output must be legible.
+#[cfg(unix)]
+#[test]
+fn audit_text_escapes_invalid_utf8_path_without_loss() {
+    use std::os::unix::ffi::OsStringExt;
+    let root = std::env::temp_dir().join(format!("stk-audit-invalid-path-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let filename = std::ffi::OsString::from_vec(b"invalid-\xff.rs".to_vec());
+    let path = root.join(filename);
+    std::fs::write(&path, UNAUTHORIZED_ENTRY_POINT).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-testkit"))
+        .arg("audit")
+        .arg(&path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.to_ascii_lowercase().contains(r"\xff"),
+        "expected escaped original byte: {stdout}"
+    );
+    assert!(!stdout.contains('\u{fffd}'), "path was lossy: {stdout}");
+    assert!(stdout.contains("missing-require-auth"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// #438: show file, table/key and line for a wrongly-typed rule option.
+#[test]
+fn audit_config_error_names_path_and_setting() {
+    let root = std::env::temp_dir().join(format!("stk-audit-bad-config-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("src.rs"), UNAUTHORIZED_ENTRY_POINT).unwrap();
+    std::fs::write(
+        root.join(".soroban-testkit.toml"),
+        "[rules.missing-require-auth]\nenabled = 'definitely'\n",
+    )
+    .unwrap();
+    let output = run(&["audit", root.to_str().unwrap()]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(".soroban-testkit.toml"), "{stderr}");
+    assert!(stderr.contains("enabled"), "{stderr}");
+    assert!(stderr.contains("line 2"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// #432: helper methods compiled only in tests must not raise production warnings.
+#[test]
+fn audit_skips_test_only_helpers_but_checks_production_methods() {
+    let source = r#"
+struct Vault;
+impl Vault {
+    pub fn live(&self, from: Address) { let _ = from; }
+}
+#[cfg(test)]
+mod tests {
+    pub fn helper(from: Address) { let _ = from; }
+    struct Helpers;
+    impl Helpers { pub fn internal(&self, from: Address) { let _ = from; } }
+}
+#[cfg(test)]
+pub fn another_helper(from: Address) { let _ = from; }
+#[cfg(not(test))]
+pub fn production_only(from: Address) { let _ = from; }
+#[cfg(any(test, feature = "logging"))]
+pub fn also_production(from: Address) { let _ = from; }
+#[cfg(all(test, feature = "logging"))]
+pub fn helper_with_feature(from: Address) { let _ = from; }
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json"], source.as_bytes());
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert!(findings
+        .iter()
+        .any(|finding| finding["message"].as_str().unwrap().contains("live")));
+    assert!(findings.iter().any(|finding| finding["message"]
+        .as_str()
+        .unwrap()
+        .contains("production_only")));
+    assert!(findings.iter().any(|finding| finding["message"]
+        .as_str()
+        .unwrap()
+        .contains("also_production")));
+    assert!(!findings.iter().any(|finding| {
+        let msg = finding["message"].as_str().unwrap();
+        msg.contains("helper") || msg.contains("internal")
+    }));
+}
+
+#[test]
+fn audit_does_not_treat_integration_test_files_as_production() {
+    let root = std::env::temp_dir().join(format!("stk-audit-test-tree-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("tests/helpers.rs"),
+        "fn helper(from: Address) { let _ = from; }",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "fn live(from: Address) { let _ = from; }",
+    )
+    .unwrap();
+    let output = run(&["audit", root.to_str().unwrap(), "--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert!(findings
+        .iter()
+        .any(|finding| finding["file"].as_str().unwrap().ends_with("src/lib.rs")));
+    assert!(!findings.iter().any(|finding| finding["file"]
+        .as_str()
+        .unwrap()
+        .ends_with("tests/helpers.rs")));
+    let _ = std::fs::remove_dir_all(&root);
 }

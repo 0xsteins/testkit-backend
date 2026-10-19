@@ -265,7 +265,9 @@ fn missing_cargo_toml_reports_metadata_error_not_instrumentation_hint() {
     let path = format!(
         "{}:{}",
         bin.display(),
-        std::env::var_os("PATH").unwrap_or_default().to_string_lossy()
+        std::env::var_os("PATH")
+            .unwrap_or_default()
+            .to_string_lossy()
     );
 
     let output = run_with_env(&["coverage"], &[("PATH", &path)], &tmp);
@@ -333,7 +335,9 @@ fn missing_cargo_llvm_cov_reports_tool_not_installed() {
     let path = format!(
         "{}:{}",
         bin.display(),
-        std::env::var_os("PATH").unwrap_or_default().to_string_lossy()
+        std::env::var_os("PATH")
+            .unwrap_or_default()
+            .to_string_lossy()
     );
 
     let output = run_with_env(&["coverage"], &[("PATH", &path)], &cwd);
@@ -358,8 +362,7 @@ fn missing_cargo_llvm_cov_reports_tool_not_installed() {
 fn metadata_error_takes_precedence_over_fail_under_hint() {
     use std::os::unix::fs::PermissionsExt;
 
-    let tmp = std::env::temp_dir()
-        .join(format!("stk-cov-meta-failunder-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("stk-cov-meta-failunder-{}", std::process::id()));
     let bin = tmp.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
 
@@ -376,7 +379,9 @@ fn metadata_error_takes_precedence_over_fail_under_hint() {
     let path = format!(
         "{}:{}",
         bin.display(),
-        std::env::var_os("PATH").unwrap_or_default().to_string_lossy()
+        std::env::var_os("PATH")
+            .unwrap_or_default()
+            .to_string_lossy()
     );
 
     let output = run_with_env(&["coverage", "--fail-under=80"], &[("PATH", &path)], &tmp);
@@ -409,14 +414,29 @@ fn exclude_flag_is_forwarded_to_subprocess_as_workspace_exclude() {
 
 #[test]
 fn multiple_exclude_flags_are_accepted() {
-    let output = run(&["coverage", "--exclude", "cli", "--exclude", "audit", "--help"]);
+    let output = run(&[
+        "coverage",
+        "--exclude",
+        "cli",
+        "--exclude",
+        "audit",
+        "--help",
+    ]);
     assert!(output.status.success());
 }
 
 /// Combining --include and --exclude is still rejected even alongside other flags.
 #[test]
 fn include_and_exclude_still_rejected_with_other_flags() {
-    let output = run(&["coverage", "--include", "testkit", "--exclude", "cli", "--format", "json"]);
+    let output = run(&[
+        "coverage",
+        "--include",
+        "testkit",
+        "--exclude",
+        "cli",
+        "--format",
+        "json",
+    ]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

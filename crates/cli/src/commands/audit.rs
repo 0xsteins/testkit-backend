@@ -540,6 +540,14 @@ pub struct DiagnosticRenderer<'a> {
     findings: &'a [Finding],
 }
 
+/// Present non-UTF-8 names unambiguously rather than replacing bytes with U+FFFD.
+/// The standard Path::display() uses a lossy conversion for such names.
+fn display_audit_path(path: &Path) -> String {
+    path.to_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{path:?}"))
+}
+
 impl<'a> DiagnosticRenderer<'a> {
     /// Create a new diagnostic renderer for the given findings.
     pub fn new(findings: &'a [Finding]) -> Self {
@@ -572,7 +580,7 @@ impl<'a> DiagnosticRenderer<'a> {
         for finding in self.findings {
             output.push_str(&format!(
                 "{}:{}: [{}] {}: {}\n",
-                finding.file.display(),
+                display_audit_path(&finding.file),
                 finding.line,
                 finding.severity,
                 finding.rule,
@@ -773,6 +781,44 @@ fn workspace_relative_path(path: &Path, workspace: &Path) -> PathBuf {
         .collect()
 }
 
+/// Extract the source line and TOML table/key from a deserialization error.
+/// If the parser cannot identify a key (e.g. an unterminated table), the
+/// source line is still helpful alongside the path and parser diagnostic.
+fn config_error_context(content: &str, err: &toml::de::Error) -> String {
+    let Some(span) = err.span() else {
+        return String::new();
+    };
+    let position = span.start.min(content.len());
+    let line_index = content
+        .get(..position)
+        .unwrap_or("")
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    let line = content.lines().nth(line_index).unwrap_or("");
+    let key = line
+        .split_once('=')
+        .map(|(key, _)| key.trim())
+        .filter(|key| !key.is_empty());
+    let section = content
+        .lines()
+        .take(line_index + 1)
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix('[')
+                .and_then(|section| section.strip_suffix(']'))
+        })
+        .last()
+        .unwrap_or("");
+    match key {
+        Some(key) if !section.is_empty() => {
+            format!(" at line {} (key `{section}.{key}`)", line_index + 1)
+        }
+        Some(key) => format!(" at line {} (key `{key}`)", line_index + 1),
+        None => format!(" at line {}", line_index + 1),
+    }
+}
+
 fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliError> {
     for dir in source_dir.ancestors() {
         for name in [".soroban-testkit.toml", "soroban-testkit.toml"] {
@@ -789,8 +835,9 @@ fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliEr
             };
             return toml::from_str(&content).map_err(|err| {
                 CliError(format!(
-                    "failed to parse audit config {} as TOML: {err}; fix the configuration syntax",
-                    path.display()
+                    "failed to parse audit config {}{} as TOML: {err}; fix the configuration syntax",
+                    path.display(),
+                    config_error_context(&content, &err)
                 ))
             });
         }
@@ -816,25 +863,22 @@ fn load_baseline(baseline_path: &Option<PathBuf>) -> Result<Vec<BaselineEntry>, 
 }
 
 /// The one canonical ordering for findings: file, then line, then rule,
-/// then message, with column breaking any remaining tie — and exact
-/// duplicates (same file, line, column, rule, and message) collapse. Every
+/// then message. Exact duplicates collapse. Every
 /// report path funnels through this routine, in `audit_source` per parsed
 /// file and again in `run` after paths are rewritten workspace-relative, so
 /// text, JSON and SARIF always list a finding in the same place regardless
 /// of scan order.
-fn normalize_findings(findings: &mut [Finding]) {
+fn normalize_findings(findings: &mut Vec<Finding>) {
     findings.sort_by(|left, right| {
         left.file
             .cmp(&right.file)
             .then(left.line.cmp(&right.line))
             .then(left.rule.cmp(right.rule))
             .then(left.message.cmp(&right.message))
-            .then(left.column.cmp(&right.column))
     });
     findings.dedup_by(|left, right| {
         left.file == right.file
             && left.line == right.line
-            && left.column == right.column
             && left.rule == right.rule
             && left.message == right.message
     });
@@ -879,6 +923,9 @@ fn audit_source(
         findings,
         config,
         suppressions: &suppressions,
+        test_context: path
+            .components()
+            .any(|part| part.as_os_str() == "tests" || part.as_os_str() == "benches"),
         source: &source_lines,
     };
     visitor.visit_file(&file);
@@ -903,12 +950,6 @@ impl SourceLines {
     pub fn get(&self, line: usize) -> Option<&String> {
         self.0.get(line.checked_sub(1)?)
     }
-
-    fn column(&self, line: usize, byte_column: usize) -> usize {
-        self.get(line).map_or(1, |source| {
-            source[..byte_column.min(source.len())].chars().count() + 1
-        })
-    }
 }
 
 struct Suppression {
@@ -918,39 +959,236 @@ struct Suppression {
     reason: Option<String>,
 }
 
+fn find_audit_directive(line: &str) -> Option<&str> {
+    let lower = line.to_lowercase();
+    let prefix_pos = lower
+        .find("soroban_testkit")
+        .or_else(|| lower.find("soroban-testkit"))?;
+    let after_prefix = &line[prefix_pos..];
+    let audit_pos = after_prefix.to_lowercase().find("audit")?;
+    let after_audit = &after_prefix[audit_pos + "audit".len()..];
+    let open_paren = after_audit.find('(')?;
+    let close_paren = after_audit.rfind(')')?;
+    (close_paren > open_paren).then_some(&after_audit[open_paren + 1..close_paren])
+}
+
 fn extract_suppressions(src: &str) -> Vec<Suppression> {
     let mut suppressions = Vec::new();
     for (idx, line) in src.lines().enumerate() {
-        if let Some(comment_start) = line.find("soroban_testkit::audit(skip") {
-            if let Some(comment_text) = line[comment_start..].split_once('(') {
-                if let Some(end_paren) = comment_text.1.rfind(')') {
-                    let content = &comment_text.1[..end_paren];
-                    let mut rules = Vec::new();
-                    let mut reason = None;
+        if let Some(content) = find_audit_directive(line) {
+            let mut rules = Vec::new();
+            let mut reason = None;
 
-                    for part in content.split(',') {
-                        let part = part.trim();
-                        if let Some(stripped) = part.strip_prefix("reason=") {
-                            reason = Some(stripped.trim_matches('"').to_string());
-                        } else if !part.is_empty() && part != "skip" {
-                            rules.push(part.to_string());
-                        }
-                    }
+            for part in content.split(',') {
+                let part = part.trim();
+                let clean = if let Some(stripped) = part
+                    .strip_prefix("reason=")
+                    .or_else(|| part.strip_prefix("reason ="))
+                {
+                    reason = Some(
+                        stripped
+                            .trim()
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .to_string(),
+                    );
+                    continue;
+                } else if let Some(stripped) = part
+                    .strip_prefix("rule=")
+                    .or_else(|| part.strip_prefix("rule ="))
+                    .or_else(|| part.strip_prefix("rule:"))
+                    .or_else(|| part.strip_prefix("rule :"))
+                    .or_else(|| part.strip_prefix("skip-"))
+                {
+                    stripped
+                } else {
+                    part
+                };
 
-                    if rules.is_empty() {
+                let clean = clean.trim().trim_matches('"').trim_matches('\'').trim();
+                if !clean.is_empty() && clean != "skip" {
+                    if clean == "all" || clean == "*" {
                         rules.push("*".to_string());
+                    } else {
+                        rules.push(clean.to_string());
                     }
-
-                    suppressions.push(Suppression {
-                        line: idx + 1,
-                        rules,
-                        reason,
-                    });
                 }
             }
+
+            if rules.is_empty() {
+                rules.push("*".to_string());
+            }
+
+            suppressions.push(Suppression {
+                line: idx + 1,
+                rules,
+                reason,
+            });
         }
     }
     suppressions
+}
+
+fn item_line_range(node: impl quote::ToTokens) -> (usize, usize) {
+    let mut min_line = usize::MAX;
+    let mut max_line = 0;
+    for token in node.to_token_stream() {
+        let span = token.span();
+        min_line = min_line.min(span.start().line);
+        max_line = max_line.max(span.end().line);
+    }
+    if min_line == usize::MAX {
+        (0, 0)
+    } else {
+        (min_line, max_line)
+    }
+}
+
+fn is_finding_suppressed(
+    suppressions: &[Suppression],
+    rule: &str,
+    finding_line: usize,
+    fn_range: Option<(usize, usize)>,
+) -> bool {
+    suppressions.iter().any(|suppression| {
+        let matches_rule = suppression
+            .rules
+            .iter()
+            .any(|item| item == "*" || item == rule);
+        matches_rule
+            && (suppression.line <= 10
+                || suppression.line == finding_line
+                || suppression.line + 1 == finding_line
+                || fn_range.is_some_and(|(start, end)| {
+                    suppression.line + 1 >= start && suppression.line <= end
+                }))
+    })
+}
+
+fn is_require_auth_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::MethodCall(call) => matches!(
+            call.method.unraw().to_string().as_str(),
+            "require_auth" | "require_auth_for_args"
+        ),
+        Expr::Call(call) => match &*call.func {
+            Expr::Path(path) => path.path.segments.last().is_some_and(|segment| {
+                matches!(
+                    segment.ident.unraw().to_string().as_str(),
+                    "require_auth" | "require_auth_for_args"
+                )
+            }),
+            _ => false,
+        },
+        Expr::Paren(paren) => is_require_auth_call(&paren.expr),
+        Expr::Group(group) => is_require_auth_call(&group.expr),
+        Expr::Try(expr_try) => is_require_auth_call(&expr_try.expr),
+        Expr::Await(expr_await) => is_require_auth_call(&expr_await.base),
+        _ => false,
+    }
+}
+
+fn is_negated_condition(expr: &Expr) -> bool {
+    match expr {
+        Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Not(_),
+            ..
+        }) => true,
+        Expr::Paren(paren) => is_negated_condition(&paren.expr),
+        Expr::Group(group) => is_negated_condition(&group.expr),
+        Expr::Binary(syn::ExprBinary {
+            left,
+            op: BinOp::Eq(_),
+            right,
+            ..
+        }) => is_lit_false(left) || is_lit_false(right),
+        Expr::Binary(syn::ExprBinary {
+            left,
+            op: BinOp::Ne(_),
+            right,
+            ..
+        }) => is_lit_true(left) || is_lit_true(right),
+        _ => false,
+    }
+}
+
+fn is_lit_false(expr: &Expr) -> bool {
+    matches!(expr, Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(value), .. }) if !value.value)
+}
+
+fn is_lit_true(expr: &Expr) -> bool {
+    matches!(expr, Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(value), .. }) if value.value)
+}
+
+struct AuthVisitor {
+    negated_depth: usize,
+    has_enforced_auth: bool,
+}
+
+impl<'ast> Visit<'ast> for AuthVisitor {
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        if is_require_auth_call(expr) && self.negated_depth == 0 {
+            self.has_enforced_auth = true;
+        }
+        visit::visit_expr(self, expr);
+    }
+
+    fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+        let is_negated = is_negated_condition(&node.cond);
+        self.negated_depth += usize::from(is_negated);
+        self.visit_block(&node.then_branch);
+        self.negated_depth -= usize::from(is_negated);
+        if let Some((_, else_branch)) = &node.else_branch {
+            self.visit_expr(else_branch);
+        }
+    }
+
+    fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+        let is_negated = is_negated_condition(&node.cond);
+        self.negated_depth += usize::from(is_negated);
+        self.visit_block(&node.body);
+        self.negated_depth -= usize::from(is_negated);
+    }
+}
+
+fn has_enforced_require_auth(block: &syn::Block) -> bool {
+    let mut visitor = AuthVisitor {
+        negated_depth: 0,
+        has_enforced_auth: false,
+    };
+    visitor.visit_block(block);
+    visitor.has_enforced_auth
+}
+
+/// True only for cfg predicates that *require* `test` to be enabled.
+/// `cfg(any(test, feature = "x"))` is not test-only: it can ship in production.
+fn cfg_requires_test(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => {
+            let Ok(parts) = list.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) else {
+                return false;
+            };
+            if list.path.is_ident("all") {
+                parts.iter().any(cfg_requires_test)
+            } else {
+                !parts.is_empty() && parts.iter().all(cfg_requires_test)
+            }
+        }
+        _ => false,
+    }
+}
+
+fn is_test_only(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("test")
+            || (attr.path().is_ident("cfg")
+                && attr
+                    .parse_args::<syn::Meta>()
+                    .is_ok_and(|meta| cfg_requires_test(&meta)))
+    })
 }
 
 struct FunctionVisitor<'a> {
@@ -958,30 +1196,57 @@ struct FunctionVisitor<'a> {
     findings: &'a mut Vec<Finding>,
     config: &'a AuditConfig,
     suppressions: &'a [Suppression],
+    test_context: bool,
     source: &'a SourceLines,
 }
 
 impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        let previous = self.test_context;
+        self.test_context |= is_test_only(&node.attrs);
+        visit::visit_item_mod(self, node);
+        self.test_context = previous;
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        let previous = self.test_context;
+        self.test_context |= is_test_only(&node.attrs);
+        visit::visit_item_impl(self, node);
+        self.test_context = previous;
+    }
+
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
         let line = line_of(node);
+        let fn_range = item_line_range(node);
         let fn_name = node.sig.ident.to_string();
         let body_src = normalized_tokens(node.to_token_stream()).to_string();
-        self.audit_function(&node.sig, body_src.clone(), line);
-        self.audit_i128_arithmetic(&node.sig, &node.block, line);
-        self.audit_ignored_transfer_results(&node.sig, &node.block);
-        self.audit_mock_all_auths(&body_src, line, &fn_name);
+        let previous = self.test_context;
+        self.test_context |= is_test_only(&node.attrs);
+        if !self.test_context {
+            self.audit_function(&node.sig, &node.block, body_src.clone(), line, fn_range);
+            self.audit_i128_arithmetic(&node.sig, &node.block, line, fn_range);
+            self.audit_ignored_transfer_results(&node.sig, &node.block, fn_range);
+        }
+        self.audit_mock_all_auths(&body_src, line, &fn_name, fn_range);
         visit::visit_item_fn(self, node);
+        self.test_context = previous;
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
         let line = line_of(node);
+        let fn_range = item_line_range(node);
         let fn_name = node.sig.ident.to_string();
         let body_src = normalized_tokens(node.to_token_stream()).to_string();
-        self.audit_function(&node.sig, body_src.clone(), line);
-        self.audit_i128_arithmetic(&node.sig, &node.block, line);
-        self.audit_ignored_transfer_results(&node.sig, &node.block);
-        self.audit_mock_all_auths(&body_src, line, &fn_name);
+        let previous = self.test_context;
+        self.test_context |= is_test_only(&node.attrs);
+        if !self.test_context {
+            self.audit_function(&node.sig, &node.block, body_src.clone(), line, fn_range);
+            self.audit_i128_arithmetic(&node.sig, &node.block, line, fn_range);
+            self.audit_ignored_transfer_results(&node.sig, &node.block, fn_range);
+        }
+        self.audit_mock_all_auths(&body_src, line, &fn_name, fn_range);
         visit::visit_impl_item_fn(self, node);
+        self.test_context = previous;
     }
 }
 
@@ -1010,14 +1275,15 @@ impl FunctionVisitor<'_> {
         block: &syn::Block,
         body_src: String,
         line: usize,
+        fn_range: (usize, usize),
     ) {
         let name = sig.ident.to_string();
 
         // Rule 1: an Address parameter that's never checked with require_auth.
         if self.is_enabled("missing-require-auth") {
             let address_params = address_typed_params(sig);
-            if !address_params.is_empty() && !body_src.contains("require_auth") {
-                self.push(
+            if !address_params.is_empty() && !has_enforced_require_auth(block) {
+                self.push_with_range(
                     line,
                     "missing-require-auth",
                     "warning",
@@ -1025,6 +1291,7 @@ impl FunctionVisitor<'_> {
                         "fn {name} takes Address parameter(s) {address_params:?} but never calls \
                          require_auth in its body"
                     ),
+                    Some(fn_range),
                 );
             }
         }
@@ -1034,7 +1301,7 @@ impl FunctionVisitor<'_> {
             let reads_persistent = body_src.contains(". persistent () . get (");
             let reads_temporary = body_src.contains(". temporary () . get (");
             if (reads_persistent || reads_temporary) && !body_src.contains(". extend_ttl (") {
-                self.push(
+                self.push_with_range(
                     line,
                     "missing-ttl-bump",
                     "warning",
@@ -1046,6 +1313,7 @@ impl FunctionVisitor<'_> {
                             "temporary"
                         }
                     ),
+                    Some(fn_range),
                 );
             }
         }
@@ -1053,7 +1321,7 @@ impl FunctionVisitor<'_> {
         if self.is_enabled("missing-positive-amount-validation") {
             for amount_param in signed_amount_params(sig) {
                 if !has_positive_amount_validation(&body_src, &amount_param) {
-                    self.push(
+                    self.push_with_range(
                         line,
                         "missing-positive-amount-validation",
                         "warning",
@@ -1061,6 +1329,7 @@ impl FunctionVisitor<'_> {
                             "fn {name} takes signed amount parameter `{amount_param}` but never \
                              validates it against zero"
                         ),
+                        Some(fn_range),
                     );
                 }
             }
@@ -1078,20 +1347,27 @@ impl FunctionVisitor<'_> {
             if has_timestamp_ops && !is_checked && body_src.contains("timestamp") {
                 // Check if it's likely timestamp arithmetic
                 if body_src.contains("timestamp()") || body_src.contains("timestamp ") {
-                    self.push(
+                    self.push_with_range(
                         line,
                         "unchecked-timestamp-arithmetic",
                         "warning",
                         format!(
                             "fn {name} performs arithmetic on timestamp values; use checked arithmetic to prevent overflow"
                         ),
+                        Some(fn_range),
                     );
                 }
             }
         }
     }
 
-    fn audit_mock_all_auths(&mut self, body_src: &str, line: usize, fn_name: &str) {
+    fn audit_mock_all_auths(
+        &mut self,
+        body_src: &str,
+        line: usize,
+        fn_name: &str,
+        fn_range: (usize, usize),
+    ) {
         if !self.is_enabled("broad-mock-all-auths") {
             return;
         }
@@ -1102,13 +1378,14 @@ impl FunctionVisitor<'_> {
         }
 
         if body_src.contains("mock_all_auths") {
-            self.push(
+            self.push_with_range(
                 line,
                 "broad-mock-all-auths",
                 "warning",
                 format!(
                     "test function {fn_name} uses mock_all_auths; prefer granular auth checks per caller"
                 ),
+                Some(fn_range),
             );
         }
     }
@@ -1121,25 +1398,20 @@ impl FunctionVisitor<'_> {
             .unwrap_or(true)
     }
 
-    fn push(
+    fn push_with_range(
         &mut self,
         line: usize,
         rule: &'static str,
         default_severity: &'static str,
         message: String,
+        fn_range: Option<(usize, usize)>,
     ) {
         if !self.is_enabled(rule) {
             return;
         }
 
-        // Check if this finding is suppressed
-        for suppression in self.suppressions {
-            if (suppression.line == line || suppression.line == line - 1)
-                && (suppression.rules.contains(&"*".to_string())
-                    || suppression.rules.iter().any(|r| r == rule))
-            {
-                return;
-            }
+        if is_finding_suppressed(self.suppressions, rule, line, fn_range) {
+            return;
         }
 
         let severity = self
@@ -1165,7 +1437,13 @@ impl FunctionVisitor<'_> {
         });
     }
 
-    fn audit_i128_arithmetic(&mut self, sig: &Signature, body: &syn::Block, line: usize) {
+    fn audit_i128_arithmetic(
+        &mut self,
+        sig: &Signature,
+        body: &syn::Block,
+        line: usize,
+        fn_range: (usize, usize),
+    ) {
         if !self.is_enabled("unchecked-i128-arithmetic") {
             return;
         }
@@ -1185,7 +1463,7 @@ impl FunctionVisitor<'_> {
             path: self.path.clone(),
             fn_name: sig.ident.to_string(),
             fn_line: line,
-            fn_column: self.current_column,
+            fn_range,
             i128_bindings,
             findings: self.findings,
             config: self.config,
@@ -1195,7 +1473,12 @@ impl FunctionVisitor<'_> {
         visitor.visit_block(body);
     }
 
-    fn audit_ignored_transfer_results(&mut self, sig: &Signature, body: &syn::Block) {
+    fn audit_ignored_transfer_results(
+        &mut self,
+        sig: &Signature,
+        body: &syn::Block,
+        fn_range: (usize, usize),
+    ) {
         if !self.is_enabled("ignored-token-transfer-result") {
             return;
         }
@@ -1203,6 +1486,7 @@ impl FunctionVisitor<'_> {
         let mut visitor = IgnoredTransferVisitor {
             path: self.path.clone(),
             fn_name: sig.ident.to_string(),
+            fn_range,
             findings: self.findings,
             config: self.config,
             suppressions: self.suppressions,
@@ -1288,34 +1572,14 @@ fn line_of(node: impl quote::ToTokens) -> usize {
     node.to_token_stream()
         .into_iter()
         .next()
-        .map(|token| {
-            let start = token.span().start();
-            (start.line, source.column(start.line, start.column))
-        })
-        .unwrap_or((0, 1))
-}
-
-fn contains_method_call(block: &syn::Block, method: &str) -> bool {
-    struct MethodCallVisitor<'a> {
-        method: &'a str,
-        found: bool,
-    }
-    impl<'ast> Visit<'ast> for MethodCallVisitor<'_> {
-        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-            if node.method == self.method {
-                self.found = true;
-            }
-            visit::visit_expr_method_call(self, node);
-        }
-    }
-    let mut visitor = MethodCallVisitor { method, found: false };
-    visitor.visit_block(block);
-    visitor.found
+        .map(|token| token.span().start().line)
+        .unwrap_or(0)
 }
 
 struct IgnoredTransferVisitor<'a> {
     path: PathBuf,
     fn_name: String,
+    fn_range: (usize, usize),
     findings: &'a mut Vec<Finding>,
     config: &'a AuditConfig,
     suppressions: &'a [Suppression],
@@ -1340,12 +1604,12 @@ impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
 
         if let Some(expr) = ignored_call {
             let line = line_of(expr);
-            let is_suppressed = self.suppressions.iter().any(|s| {
-                (s.line == line || s.line == line - 1)
-                    && (s.rules.contains(&"*".to_string())
-                        || s.rules
-                            .contains(&"ignored-token-transfer-result".to_string()))
-            });
+            let is_suppressed = is_finding_suppressed(
+                self.suppressions,
+                "ignored-token-transfer-result",
+                line,
+                Some(self.fn_range),
+            );
 
             if !is_suppressed {
                 let severity = self
@@ -1358,7 +1622,6 @@ impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
                 self.findings.push(Finding {
                     file: self.path.clone(),
                     line,
-                    column,
                     rule: "ignored-token-transfer-result",
                     severity: severity.to_string(),
                     message: format!(
@@ -1411,6 +1674,7 @@ struct I128ArithmeticVisitor<'a> {
     path: PathBuf,
     fn_name: String,
     fn_line: usize,
+    fn_range: (usize, usize),
     i128_bindings: HashSet<String>,
     findings: &'a mut Vec<Finding>,
     config: &'a AuditConfig,
@@ -1436,11 +1700,12 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
             BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_) | BinOp::Div(_)
         );
         if is_arith && (self.touches_i128(&node.left) || self.touches_i128(&node.right)) {
-            let is_suppressed = self.suppressions.iter().any(|s| {
-                (s.line == self.fn_line || s.line == self.fn_line - 1)
-                    && (s.rules.contains(&"*".to_string())
-                        || s.rules.contains(&"unchecked-i128-arithmetic".to_string()))
-            });
+            let is_suppressed = is_finding_suppressed(
+                self.suppressions,
+                "unchecked-i128-arithmetic",
+                self.fn_line,
+                Some(self.fn_range),
+            );
 
             if !is_suppressed {
                 let severity = self
@@ -1518,7 +1783,7 @@ mod tests {
             config,
             suppressions: &suppressions,
             source: &source_lines,
-            current_column: 1,
+            test_context: false,
         };
         visitor.visit_file(&file);
         findings
@@ -1698,7 +1963,9 @@ mod tests {
             &AuditConfig::default(),
         );
         assert!(
-            findings.iter().any(|f| f.rule == "unchecked-i128-arithmetic"),
+            findings
+                .iter()
+                .any(|f| f.rule == "unchecked-i128-arithmetic"),
             "Expected to find unchecked-i128-arithmetic finding"
         );
     }
@@ -1895,7 +2162,9 @@ mod tests {
 
         let sarif = render_findings(&findings, AuditOutputFormat::Sarif).unwrap();
         let report: serde_json::Value = serde_json::from_str(&sarif).unwrap();
-        let limitations = report["runs"][0]["properties"]["limitations"].as_array().unwrap();
+        let limitations = report["runs"][0]["properties"]["limitations"]
+            .as_array()
+            .unwrap();
         assert!(
             limitations
                 .iter()
@@ -1970,8 +2239,8 @@ mod tests {
         let findings = audit_source_for_test("pub fn deposit(amount: i128) { save(amount); }");
         let sarif = render_findings(&findings, AuditOutputFormat::Sarif).unwrap();
         let report: serde_json::Value = serde_json::from_str(&sarif).unwrap();
-        let snippet = report["runs"][0]["results"][0]["locations"][0]["physicalLocation"]
-            ["region"]["snippet"]["text"]
+        let snippet = report["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"]
+            ["snippet"]["text"]
             .as_str()
             .unwrap();
         assert_eq!(snippet, "pub fn deposit(amount: i128) { save(amount); }");
@@ -2035,7 +2304,10 @@ mod tests {
     #[test]
     fn canonical_path_failure_names_the_path_and_the_check_to_make() {
         let missing = std::env::temp_dir()
-            .join(format!("stk-audit-canonical-missing-{}", std::process::id()))
+            .join(format!(
+                "stk-audit-canonical-missing-{}",
+                std::process::id()
+            ))
             .join("nope.rs");
         let message = canonical_path(&missing).unwrap_err().0;
         assert!(message.contains("failed to resolve path"), "{message}");
@@ -2081,7 +2353,6 @@ mod tests {
         Finding {
             file: PathBuf::from(file),
             line,
-            column: 1,
             rule,
             severity: "warning".to_string(),
             message: message.to_string(),
@@ -2098,12 +2369,7 @@ mod tests {
             sample_finding("a.rs", 9, "missing-require-auth", "another message"),
             // The rule sorts before the message does, so a lexicographically
             // later message still lands first when its rule is smaller.
-            sample_finding(
-                "a.rs",
-                9,
-                "missing-positive-amount-validation",
-                "z message",
-            ),
+            sample_finding("a.rs", 9, "missing-positive-amount-validation", "z message"),
         ];
 
         normalize_findings(&mut findings);

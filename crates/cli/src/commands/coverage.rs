@@ -191,7 +191,7 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
     // from cargo-llvm-cov reaches the terminal in real time.
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|err| match err.kind() {
+    let child = cmd.spawn().map_err(|err| match err.kind() {
         std::io::ErrorKind::NotFound => CliError(identify_missing_coverage_dependency()),
         _ => CliError(format!(
             "failed to run `cargo llvm-cov` ({err}); is cargo-llvm-cov installed? \

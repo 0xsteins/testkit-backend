@@ -190,8 +190,14 @@ fn address_sequence_identical_with_and_without_interleaved_tokens() {
     let n1 = without_tokens.address();
     let n2 = without_tokens.address();
 
-    assert_eq!(w1, n1, "interleaved token() before first address shifted stream");
-    assert_eq!(w2, n2, "interleaved token() between addresses shifted stream");
+    assert_eq!(
+        w1, n1,
+        "interleaved token() before first address shifted stream"
+    );
+    assert_eq!(
+        w2, n2,
+        "interleaved token() between addresses shifted stream"
+    );
 }
 
 #[test]
