@@ -405,6 +405,7 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     let mut last_failure_category: Option<ProbeFailureCategory> = None;
     let mut first_failed_probe_stderr: Option<String> = None;
     let mut hit_upper_bound = false;
+    let mut last_failing_probe_value: Option<u32> = None;
 
     let mut probe = |value: u32| -> Result<ProbeOutcome, CliError> {
         let child = Command::new(&self_exe)
@@ -448,6 +449,7 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         };
         if let ProbeOutcome::Failed(category) = outcome {
             *probe_failure_counts.entry(category).or_insert(0) += 1;
+            last_failing_probe_value = Some(value);
             // Capture the child's stderr the first time a probe fails, so the
             // report carries actionable context about *why* the ceiling was
             // hit rather than silently discarding it. Only the first failure
@@ -522,7 +524,8 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     };
 
     // Binary search between the last success and the first failure for a
-    // tighter bound, if we found one.
+    // tighter bound, if we found one. Use the last failing probe value to
+    // ensure we have a deterministic stopping condition.
     let mut best = last_ok;
     let mut first_failed = last_failed_probe;
     let mut first_failure_category = last_failure_category;
@@ -532,6 +535,9 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
             refine_upper_bound_audited(last_ok, hi_start, &mut probe)?;
         best = last_success;
         first_failed = Some(first_failure);
+        // Update last_failing_probe_value to track the final boundary failure
+        // (the last value in the refine ment that failed).
+        last_failing_probe_value = Some(first_failure);
         // The value that set the final upper bound is the last failing step,
         // so its category is the standardized reason for the boundary. Fall
         // back to the doubling probe's category if refinement took no steps.
@@ -2690,5 +2696,60 @@ mod tests {
                 || json["first_failed_probe_stderr"].is_null(),
             "stderr should be skipped when None: {json}"
         );
+    }
+
+    // ---- Issue #233: paths with spaces ----
+
+    #[test]
+    fn sanitize_report_path_preserves_spaces_in_relative_paths() {
+        let path = Path::new("path/to/my contract.wasm");
+        let sanitized = sanitize_report_path(path);
+        assert_eq!(sanitized, "path/to/my contract.wasm");
+    }
+
+    #[test]
+    fn export_results_handles_path_with_spaces_json() {
+        let dir = std::env::temp_dir().join(format!("stk-limits-spaces-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let export_path = dir.join("my results.json");
+
+        let summary = sample_summary();
+        let result = export_results(&export_path, &summary);
+        assert!(
+            result.is_ok(),
+            "should handle spaces in export path: {:?}",
+            result.err()
+        );
+        assert!(
+            export_path.exists(),
+            "export should create file at path with spaces"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn baseline_write_handles_path_with_spaces() {
+        let dir = std::env::temp_dir().join(format!("stk-baseline-spaces-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let baseline_path = dir.join("my baseline file.baseline");
+
+        let result = write_baseline(
+            &baseline_path,
+            Path::new("contract.wasm"),
+            "recipients",
+            "batch_payout",
+            100,
+            1_000_000,
+            50_000,
+        );
+        assert!(
+            result.is_ok(),
+            "should handle spaces in baseline path: {:?}",
+            result.err()
+        );
+        assert!(baseline_path.exists(), "baseline should be created");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
