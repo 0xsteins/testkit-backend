@@ -26,6 +26,16 @@ pub const MACRO_SOURCE_LIMITATION: &str =
 pub const FINDING_NATURE: &str =
     "heuristic: each finding is a pattern-match signal for manual review, possibly a false positive; it is not a definitive defect report and a clean scan is not a security guarantee";
 
+/// How to read a parse warning as distinct from a finding. A **finding** is
+/// a heuristic pattern match over source that parsed successfully: it is
+/// rendered in the report, counted in `summary.finding_count`, and is the
+/// only thing `--strict` fails on. A **parse warning** means an input could
+/// not be read or parsed, so it was never scanned at all: warnings go to
+/// stderr only, never count as findings, and make the audit incomplete
+/// rather than a strict-mode failure.
+pub const PARSE_WARNING_NATURE: &str =
+    "parse warnings are not findings: an input that could not be read or parsed was skipped without being scanned; warnings are reported on stderr only, never counted in finding_count, and never trigger --strict; they make the audit incomplete instead";
+
 /// Single mapping from a rule severity to a SARIF reporting level. Both the
 /// `rules` metadata and the `results` entries (and the `audit rules`
 /// machine-readable listing) route through this one function, so the
@@ -90,14 +100,23 @@ pub struct AuditArgs {
     /// "no findings" result. Explicitly selecting an excluded directory or
     /// one of its files still scans that input. Empty Rust files are valid
     /// and produce no findings.
-    /// Findings and baseline entries use workspace-relative paths. Config is
-    /// discovered from the source directory up to the workspace root (or
-    /// from the current directory for stdin). Files that cannot be read or
-    /// parsed are reported on stderr; other files are scanned, then the
-    /// command exits non-zero to indicate an incomplete audit.
+    /// Findings and baseline entries use workspace-relative paths, and
+    /// findings are reported in one canonical order: file, then line, then
+    /// rule, then message. Config is discovered from the source directory
+    /// up to the workspace root (or from the current directory for stdin).
+    /// Files that cannot be read or parsed produce a *parse warning* on
+    /// stderr — an input skipped, never scanned — not a finding: warnings
+    /// never appear in the report, never count toward `finding_count`, and
+    /// never trigger `--strict`. Other files are scanned, then the command
+    /// exits non-zero to indicate an incomplete audit.
     ///
     /// This static scan does not expand procedural macros or macro_rules!
     /// invocations. Inspect generated code separately (e.g. cargo expand).
+    ///
+    /// Every path the command compares or prints is normalized through one
+    /// canonical routine first (symlinks and `.`/`..` components resolved),
+    /// so one file always reports under a single workspace-relative
+    /// spelling no matter how it was spelled on the command line.
     #[arg(value_name = "PATH", default_value = ".", global = true)]
     path: PathBuf,
     /// Exit non-zero if any findings are reported.
@@ -229,21 +248,16 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     }
 
     let stdin = args.path == Path::new("-");
-    let mut scan_errors = Vec::new();
+    let mut parse_warnings = Vec::new();
     let sources = if stdin {
         Vec::new()
     } else {
-        collect_rust_sources(&args.path, &mut scan_errors)?
+        collect_rust_sources(&args.path, &mut parse_warnings)?
     };
     let source_dir = if stdin {
-        std::env::current_dir()?
+        canonical_path(&std::env::current_dir()?)?
     } else {
-        let root = fs::canonicalize(&args.path).map_err(|err| {
-            CliError(format!(
-                "failed to resolve scan path {}: {err}",
-                args.path.display()
-            ))
-        })?;
+        let root = canonical_path(&args.path)?;
         if root.is_dir() {
             root
         } else {
@@ -272,12 +286,12 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
             &config,
             &source,
         ) {
-            scan_errors.push(err);
+            parse_warnings.push(err);
         }
     } else {
         for path in sources {
             if let Err(err) = audit_file(&path, &mut findings, &config) {
-                scan_errors.push(err);
+                parse_warnings.push(err);
             }
         }
         for finding in &mut findings {
@@ -286,17 +300,25 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     }
 
     findings.retain(|f| !baseline.iter().any(|b| f.matches_baseline(b)));
+    // Paths are final now, so this is the ordering every rendered report
+    // is guaranteed to follow.
+    normalize_findings(&mut findings);
 
     print!("{}", render_findings(&findings, args.format)?);
 
-    if !scan_errors.is_empty() {
-        for error in &scan_errors {
-            eprintln!("audit: {error}");
+    // Findings (heuristic pattern matches over parsed source) were just
+    // rendered above; these are parse warnings (inputs that were never
+    // scanned), and the two are reported through different channels on
+    // purpose so a skipped file can never be mistaken for a finding.
+    if !parse_warnings.is_empty() {
+        for warning in &parse_warnings {
+            eprintln!("audit: warning: {warning}");
         }
+        eprintln!("audit: note: {PARSE_WARNING_NATURE}");
         return Err(CliError(format!(
-            "audit incomplete: {} scan error(s); findings cover only successfully parsed files; \
-             fix the reported paths and re-run",
-            scan_errors.len()
+            "audit incomplete: {} parse warning(s); findings cover only successfully parsed files; \
+             fix the reported inputs and re-run",
+            parse_warnings.len()
         )));
     }
 
@@ -342,7 +364,10 @@ fn is_scannable_entry(entry: &walkdir::DirEntry) -> bool {
 /// A root that does not exist is an error, not an empty scan: silently
 /// reporting "no findings" for a typo'd path would be worse than useless in
 /// CI, so the message names every supported input form.
-fn collect_rust_sources(root: &Path, errors: &mut Vec<CliError>) -> Result<Vec<PathBuf>, CliError> {
+fn collect_rust_sources(
+    root: &Path,
+    warnings: &mut Vec<CliError>,
+) -> Result<Vec<PathBuf>, CliError> {
     fs::metadata(root).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             CliError(format!(
@@ -367,7 +392,7 @@ fn collect_rust_sources(root: &Path, errors: &mut Vec<CliError>) -> Result<Vec<P
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
-                errors.push(CliError(format!(
+                warnings.push(CliError(format!(
                     "failed to scan directory {}: {err}; check path permissions and re-run",
                     err.path().unwrap_or(root).display()
                 )));
@@ -700,6 +725,23 @@ pub fn render_sarif(findings: &[Finding]) -> Result<String, CliError> {
     DiagnosticRenderer::new(findings).render_sarif()
 }
 
+/// The one canonical path normalization routine for `audit`. The path is
+/// resolved through the operating system (symlinks, `.` and `..` components,
+/// redundant separators) and rebuilt from its components, so every spelling
+/// of one file normalizes to a single value. The scan root, the stdin start
+/// directory, finding paths, and baseline entries all normalize here, and a
+/// failure carries actionable context for the caller to surface.
+fn canonical_path(path: &Path) -> Result<PathBuf, CliError> {
+    fs::canonicalize(path)
+        .map(|resolved| resolved.components().collect())
+        .map_err(|err| {
+            CliError(format!(
+                "failed to resolve path {}: {err}; verify the path exists and is readable",
+                path.display()
+            ))
+        })
+}
+
 // Prefer a Cargo workspace, then a repository root, then the nearest crate.
 // Do not cross a repository boundary to discover another project's config.
 fn find_workspace_root(source_dir: &Path) -> PathBuf {
@@ -723,7 +765,7 @@ fn find_workspace_root(source_dir: &Path) -> PathBuf {
 }
 
 fn workspace_relative_path(path: &Path, workspace: &Path) -> PathBuf {
-    let absolute = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let absolute = canonical_path(path).unwrap_or_else(|_| path.to_path_buf());
     absolute
         .strip_prefix(workspace)
         .unwrap_or(&absolute)
@@ -773,6 +815,31 @@ fn load_baseline(baseline_path: &Option<PathBuf>) -> Result<Vec<BaselineEntry>, 
     }
 }
 
+/// The one canonical ordering for findings: file, then line, then rule,
+/// then message, with column breaking any remaining tie — and exact
+/// duplicates (same file, line, column, rule, and message) collapse. Every
+/// report path funnels through this routine, in `audit_source` per parsed
+/// file and again in `run` after paths are rewritten workspace-relative, so
+/// text, JSON and SARIF always list a finding in the same place regardless
+/// of scan order.
+fn normalize_findings(findings: &mut [Finding]) {
+    findings.sort_by(|left, right| {
+        left.file
+            .cmp(&right.file)
+            .then(left.line.cmp(&right.line))
+            .then(left.rule.cmp(right.rule))
+            .then(left.message.cmp(&right.message))
+            .then(left.column.cmp(&right.column))
+    });
+    findings.dedup_by(|left, right| {
+        left.file == right.file
+            && left.line == right.line
+            && left.column == right.column
+            && left.rule == right.rule
+            && left.message == right.message
+    });
+}
+
 fn audit_file(
     path: &Path,
     findings: &mut Vec<Finding>,
@@ -815,6 +882,7 @@ fn audit_source(
         source: &source_lines,
     };
     visitor.visit_file(&file);
+    normalize_findings(findings);
     Ok(())
 }
 
@@ -834,6 +902,12 @@ impl SourceLines {
     /// past the end of the file.
     pub fn get(&self, line: usize) -> Option<&String> {
         self.0.get(line.checked_sub(1)?)
+    }
+
+    fn column(&self, line: usize, byte_column: usize) -> usize {
+        self.get(line).map_or(1, |source| {
+            source[..byte_column.min(source.len())].chars().count() + 1
+        })
     }
 }
 
@@ -930,7 +1004,13 @@ fn normalized_tokens(tokens: TokenStream) -> TokenStream {
 }
 
 impl FunctionVisitor<'_> {
-    fn audit_function(&mut self, sig: &Signature, body_src: String, line: usize) {
+    fn audit_function(
+        &mut self,
+        sig: &Signature,
+        block: &syn::Block,
+        body_src: String,
+        line: usize,
+    ) {
         let name = sig.ident.to_string();
 
         // Rule 1: an Address parameter that's never checked with require_auth.
@@ -1105,6 +1185,7 @@ impl FunctionVisitor<'_> {
             path: self.path.clone(),
             fn_name: sig.ident.to_string(),
             fn_line: line,
+            fn_column: self.current_column,
             i128_bindings,
             findings: self.findings,
             config: self.config,
@@ -1207,8 +1288,29 @@ fn line_of(node: impl quote::ToTokens) -> usize {
     node.to_token_stream()
         .into_iter()
         .next()
-        .map(|t| t.span().start().line)
-        .unwrap_or(0)
+        .map(|token| {
+            let start = token.span().start();
+            (start.line, source.column(start.line, start.column))
+        })
+        .unwrap_or((0, 1))
+}
+
+fn contains_method_call(block: &syn::Block, method: &str) -> bool {
+    struct MethodCallVisitor<'a> {
+        method: &'a str,
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for MethodCallVisitor<'_> {
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            if node.method == self.method {
+                self.found = true;
+            }
+            visit::visit_expr_method_call(self, node);
+        }
+    }
+    let mut visitor = MethodCallVisitor { method, found: false };
+    visitor.visit_block(block);
+    visitor.found
 }
 
 struct IgnoredTransferVisitor<'a> {
@@ -1256,6 +1358,7 @@ impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
                 self.findings.push(Finding {
                     file: self.path.clone(),
                     line,
+                    column,
                     rule: "ignored-token-transfer-result",
                     severity: severity.to_string(),
                     message: format!(
@@ -1415,6 +1518,7 @@ mod tests {
             config,
             suppressions: &suppressions,
             source: &source_lines,
+            current_column: 1,
         };
         visitor.visit_file(&file);
         findings
@@ -1885,5 +1989,170 @@ mod tests {
         {
             assert_eq!(finding.source_snippet.as_deref(), Some(source));
         }
+    }
+
+    // ---- #488: one canonical path normalization routine ----
+
+    #[test]
+    fn canonical_path_maps_equivalent_spellings_to_one_value() {
+        let root = std::env::temp_dir().join(format!("stk-audit-canonical-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+
+        let expected = fs::canonicalize(root.join("src/lib.rs")).unwrap();
+        assert!(expected.is_absolute());
+        assert_eq!(canonical_path(&root.join("src/lib.rs")).unwrap(), expected);
+        assert_eq!(
+            canonical_path(&root.join("src/../src/lib.rs")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            canonical_path(&root.join("./src/./lib.rs")).unwrap(),
+            expected
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_path_follows_symlinks_before_comparing() {
+        let root = std::env::temp_dir().join(format!("stk-audit-symlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("real")).unwrap();
+        fs::write(root.join("real/lib.rs"), "").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+
+        assert_eq!(
+            canonical_path(&root.join("link/lib.rs")).unwrap(),
+            canonical_path(&root.join("real/lib.rs")).unwrap()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn canonical_path_failure_names_the_path_and_the_check_to_make() {
+        let missing = std::env::temp_dir()
+            .join(format!("stk-audit-canonical-missing-{}", std::process::id()))
+            .join("nope.rs");
+        let message = canonical_path(&missing).unwrap_err().0;
+        assert!(message.contains("failed to resolve path"), "{message}");
+        assert!(message.contains("nope.rs"), "{message}");
+        assert!(message.contains("verify the path exists"), "{message}");
+    }
+
+    #[test]
+    fn workspace_relative_path_normalizes_before_stripping_the_root() {
+        let root =
+            std::env::temp_dir().join(format!("stk-audit-ws-relative-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+        let workspace = fs::canonicalize(&root).unwrap();
+
+        assert_eq!(
+            workspace_relative_path(&workspace.join("src/../src/lib.rs"), &workspace),
+            PathBuf::from("src/lib.rs")
+        );
+        assert_eq!(
+            workspace_relative_path(&workspace.join("src/lib.rs"), &workspace),
+            PathBuf::from("src/lib.rs")
+        );
+
+        // A file outside the workspace keeps its full canonical path instead
+        // of a misleading stripped one.
+        let outside =
+            std::env::temp_dir().join(format!("stk-audit-outside-{}", std::process::id()));
+        fs::write(&outside, "").unwrap();
+        assert_eq!(
+            workspace_relative_path(&outside, &workspace),
+            fs::canonicalize(&outside).unwrap()
+        );
+
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- #485: findings sort by file, line, rule, and message ----
+
+    fn sample_finding(file: &str, line: usize, rule: &'static str, message: &str) -> Finding {
+        Finding {
+            file: PathBuf::from(file),
+            line,
+            column: 1,
+            rule,
+            severity: "warning".to_string(),
+            message: message.to_string(),
+            source_snippet: None,
+        }
+    }
+
+    #[test]
+    fn normalize_findings_orders_by_file_line_rule_and_message() {
+        let mut findings = vec![
+            sample_finding("b.rs", 9, "missing-ttl-bump", "later file"),
+            sample_finding("a.rs", 9, "missing-require-auth", "second message"),
+            sample_finding("a.rs", 2, "missing-require-auth", "first line"),
+            sample_finding("a.rs", 9, "missing-require-auth", "another message"),
+            // The rule sorts before the message does, so a lexicographically
+            // later message still lands first when its rule is smaller.
+            sample_finding(
+                "a.rs",
+                9,
+                "missing-positive-amount-validation",
+                "z message",
+            ),
+        ];
+
+        normalize_findings(&mut findings);
+
+        let ordered: Vec<_> = findings
+            .iter()
+            .map(|f| (f.file.to_str().unwrap(), f.line, f.message.as_str()))
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                ("a.rs", 2, "first line"),
+                ("a.rs", 9, "z message"),
+                ("a.rs", 9, "another message"),
+                ("a.rs", 9, "second message"),
+                ("b.rs", 9, "later file"),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_findings_collapses_only_exact_duplicates() {
+        let mut findings = vec![
+            sample_finding(
+                "a.rs",
+                1,
+                "missing-positive-amount-validation",
+                "fn f takes `amount1`",
+            ),
+            sample_finding(
+                "a.rs",
+                1,
+                "missing-positive-amount-validation",
+                "fn f takes `amount2`",
+            ),
+            sample_finding(
+                "a.rs",
+                1,
+                "missing-positive-amount-validation",
+                "fn f takes `amount1`",
+            ),
+        ];
+
+        normalize_findings(&mut findings);
+
+        let messages: Vec<_> = findings.iter().map(|f| f.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            vec!["fn f takes `amount1`", "fn f takes `amount2`"]
+        );
     }
 }

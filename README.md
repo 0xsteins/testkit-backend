@@ -145,22 +145,31 @@ comment-only Rust files are valid inputs with no findings. Raw identifiers
 such as `r#amount` are checked the same way as their ordinary spellings.
 
 Findings use paths relative to the Cargo workspace root (or the repository
-root or crate root when there is no workspace). The nearest
-`.soroban-testkit.toml` or `soroban-testkit.toml` between the scanned source
-directory and that root supplies rule configuration; the dotted name takes
-precedence in the same directory. Single-file scans start config discovery
-at the file's parent, and stdin scans start at the current directory.
+root or crate root when there is no workspace). Every path the command
+compares or prints is normalized first — symlinks and `.`/`..` components
+resolved — so one file always reports under a single spelling however its
+scan root was spelled on the command line. Findings are then reported in
+one deterministic order — file, then line, then rule, then message — so a
+report diff always reflects a real change rather than scan order. The
+nearest `.soroban-testkit.toml` or `soroban-testkit.toml` between the
+scanned source directory and that root supplies rule configuration; the
+dotted name takes precedence in the same directory. Single-file scans start
+config discovery at the file's parent, and stdin scans start at the current
+directory.
 `--baseline baseline.json` resolves the baseline file from the current
 directory, while its `file` entries are workspace-relative, so one baseline
 works from member crates too. Absolute entries are also accepted.
 
 Unreadable files, directory traversal failures, and Rust parse errors are
 reported separately on stderr with the affected path (and line/column for
-syntax errors). The scan continues through other files and writes their
-findings in the requested format, then exits non-zero to signal an
-incomplete audit even without `--strict`. Fix these errors before treating
-an empty report as a clean scan. JSON reports escape control characters in
-file names and diagnostic text.
+syntax errors). These are *parse warnings*, not findings: a warning means
+the input was skipped rather than scanned, so it never appears in the
+report, never counts toward `finding_count`, and never triggers `--strict`.
+The scan continues through other files and writes their findings in the
+requested format, then exits non-zero to signal an incomplete audit even
+without `--strict`. Fix these warnings before treating an empty report as a
+clean scan. JSON reports escape control characters in file names and
+diagnostic text.
 
 **Audit limitation:** the linter inspects written Rust source only. It does
 not expand procedural macros (including Soroban contract macros) or

@@ -240,7 +240,10 @@ fn audit_raw_identifiers_report_the_same_rules_as_ordinary_identifiers() {
             }
         }
     }
-    assert_eq!(reports[0].len(), 6, "{reports:?}");
+    // Six raw findings fire (require-auth, ttl, positive-amount, transfer,
+    // and two i128 additions), but the two i128 findings share a
+    // file/line/column/rule and collapse, so both spellings report five.
+    assert_eq!(reports[0].len(), 5, "{reports:?}");
     assert_eq!(reports[0], reports[1]);
 }
 
@@ -581,9 +584,10 @@ fn audit_continues_after_read_and_parse_errors_in_every_format() {
         assert!(errors.contains("failed to parse Rust source"), "{errors}");
         assert!(errors.contains("b-invalid.rs:1:"), "{errors}");
         assert!(
-            errors.contains("audit incomplete: 2 scan error(s)"),
+            errors.contains("audit incomplete: 2 parse warning(s)"),
             "{errors}"
         );
+        assert!(errors.contains("audit: warning:"), "{errors}");
         let findings = String::from_utf8_lossy(&output.stdout);
         assert!(findings.contains("z-valid.rs"), "{findings}");
         assert!(findings.contains("missing-require-auth"), "{findings}");
@@ -635,7 +639,7 @@ fn audit_continues_past_permission_denied_files_and_directories() {
         assert!(errors.contains("a-denied.rs"), "{errors}");
         assert!(errors.contains("failed to scan directory"), "{errors}");
         assert!(errors.contains("b-denied"), "{errors}");
-        assert!(errors.contains("2 scan error(s)"), "{errors}");
+        assert!(errors.contains("2 parse warning(s)"), "{errors}");
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(report["findings"][0]["file"], "z-readable.rs");
         assert_eq!(report["summary"]["finding_count"], 1);
@@ -1130,4 +1134,208 @@ fn audit_reports_source_snippets_without_leaking_terminal_control_sequences() {
         "pub fn withdraw(env: Env, from: Address) { let _ = &from; } // red"
     );
  main
+}
+
+// ---- #485: findings sort by file, line, rule, and message ----
+
+#[test]
+fn audit_orders_findings_by_rule_rather_than_scan_order_or_column() {
+    let fixture = AuditFixture::new("finding-order");
+    // Both functions sit on one physical line: `alpha` starts at column 1
+    // and is visited first, but `missing-positive-amount-validation` sorts
+    // before `missing-require-auth`, so the report follows the rule — not
+    // the scan order or the column.
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        "pub fn alpha(env: Env, from: Address) { let _ = &from; } \
+         pub fn beta(amount: i128) { save(amount); }\n",
+    );
+
+    let first = fixture.scan(&["--strict"]);
+    assert!(!first.status.success(), "{first:?}");
+    let report: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 2, "{report}");
+    let rules: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| finding["rule"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        rules,
+        vec!["missing-positive-amount-validation", "missing-require-auth"],
+        "{report}"
+    );
+
+    // The order is deterministic across runs.
+    let second = fixture.scan(&["--strict"]);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&second.stdout).unwrap(),
+        report
+    );
+}
+
+// ---- #488: one canonical path normalization routine ----
+
+#[test]
+fn audit_normalizes_equivalent_spellings_of_one_scan_root() {
+    let fixture = AuditFixture::new("canonical-roots");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let mut reports = Vec::new();
+    for root in [
+        "crates/vault/src/lib.rs",
+        "./crates/vault/./src/../src/lib.rs",
+        "crates/vault/src/../../vault/src/lib.rs",
+    ] {
+        let output = run_from(&fixture.0, &["audit", root, "--format", "json"]);
+        assert!(output.status.success(), "root {root}: {output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["findings"][0]["file"], "crates/vault/src/lib.rs",
+            "root {root}: {report}"
+        );
+        reports.push(report);
+    }
+    assert_eq!(reports[0], reports[1]);
+    assert_eq!(reports[1], reports[2]);
+}
+
+// ---- #487: a parse warning is not a finding ----
+
+#[test]
+fn audit_reports_parse_warnings_on_stderr_and_findings_in_the_report() {
+    let fixture = AuditFixture::new("finding-vs-warning");
+    fixture.write("broken.rs", "fn broken( {\n");
+    fixture.write("good.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--format", "json", "--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+
+    // The report counts only parsed source; the skipped file never becomes
+    // a finding.
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1, "{report}");
+    let files: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| finding["file"].as_str().unwrap())
+        .collect();
+    assert_eq!(files, vec!["good.rs"], "{report}");
+
+    // The warning lives only on stderr, labelled as a warning, with the
+    // finding/warning distinction stated alongside it.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("audit: warning: failed to parse Rust source"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("parse warnings are not findings"), "{stderr}");
+    assert!(
+        stderr.contains("audit incomplete: 1 parse warning(s)"),
+        "{stderr}"
+    );
+    // The incomplete audit — not --strict — is what failed this run.
+    assert!(!stderr.contains("(--strict)"), "{stderr}");
+}
+
+#[test]
+fn audit_parse_warnings_fail_the_run_without_acting_like_strict_findings() {
+    let fixture = AuditFixture::new("warnings-not-findings");
+    fixture.write("clean.rs", "// nothing to scan\n");
+    fixture.write("broken.rs", "fn broken( {\n");
+
+    let output = fixture.scan(&["--format", "json", "--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 0, "{report}");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("audit incomplete: 1 parse warning(s)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("parse warnings are not findings"), "{stderr}");
+    // No heuristic finding existed, so the strict-failure wording must not
+    // appear: parse warnings never reach --strict.
+    assert!(!stderr.contains("audit finding(s)"), "{stderr}");
+}
+
+#[test]
+fn audit_strict_failure_reports_findings_and_no_parse_warnings() {
+    let fixture = AuditFixture::new("strict-findings-only");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--format", "json", "--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("1 audit finding(s) (--strict)"), "{stderr}");
+    assert!(!stderr.contains("parse warning"), "{stderr}");
+    assert!(!stderr.contains("audit: warning:"), "{stderr}");
+}
+
+// ---- #486: regression snapshots for strict and report-only modes ----
+
+/// The exact report both modes must print. `--strict` changes only the exit
+/// status and the error on stderr — never a byte of the report itself.
+const FINDINGS_REPORT_SNAPSHOT: &str = include_str!("snapshots/audit_findings_report.txt");
+const CLEAN_REPORT_SNAPSHOT: &str = include_str!("snapshots/audit_clean_report.txt");
+const STRICT_ERROR_SNAPSHOT: &str = include_str!("snapshots/audit_strict_error.txt");
+
+/// One physical line, exactly one finding: the source both mode snapshots
+/// scan, so the snapshot pins report shape rather than scan ordering.
+const SNAPSHOT_ENTRY_POINT: &str = "pub fn withdraw(env: Env, from: Address) { let _ = &from; }\n";
+
+#[test]
+fn audit_report_only_mode_matches_its_regression_snapshot() {
+    let fixture = AuditFixture::new("snapshot-report-only");
+    fixture.write("crates/vault/src/lib.rs", SNAPSHOT_ENTRY_POINT);
+
+    let output = fixture.scan(&["--format", "text"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        FINDINGS_REPORT_SNAPSHOT,
+        "report-only snapshot changed"
+    );
+}
+
+#[test]
+fn audit_strict_mode_matches_its_regression_snapshot() {
+    let fixture = AuditFixture::new("snapshot-strict");
+    fixture.write("crates/vault/src/lib.rs", SNAPSHOT_ENTRY_POINT);
+
+    let output = fixture.scan(&["--format", "text", "--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+    // Strict fails the run without changing a single byte of the report.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        FINDINGS_REPORT_SNAPSHOT,
+        "strict-mode report snapshot changed"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        STRICT_ERROR_SNAPSHOT,
+        "strict-mode error snapshot changed"
+    );
+}
+
+#[test]
+fn audit_clean_report_is_snapshotted_in_both_modes() {
+    let fixture = AuditFixture::new("snapshot-clean");
+    fixture.write("crates/vault/src/lib.rs", "// nothing to flag\n");
+    let modes: &[&[&str]] = &[&["--format", "text"], &["--format", "text", "--strict"]];
+    for args in modes {
+        let output = fixture.scan(args);
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            CLEAN_REPORT_SNAPSHOT,
+            "clean-report snapshot changed for {args:?}"
+        );
+    }
 }

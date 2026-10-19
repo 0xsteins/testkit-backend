@@ -1,0 +1,3 @@
+audit: no findings
+note: source-only scan: procedural macros and macro_rules! are not expanded; generated entry points and other generated code require separate inspection
+note: heuristic: each finding is a pattern-match signal for manual review, possibly a false positive; it is not a definitive defect report and a clean scan is not a security guarantee
