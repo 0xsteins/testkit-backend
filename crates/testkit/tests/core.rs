@@ -148,3 +148,73 @@ fn edge_cases_empty_and_special_characters_in_operation_and_contract() {
         "operation 'transfer_💰' on contract 'Contract #42 (Stellar/Testnet)': misuse of testkit API: invalid symbol"
     );
 }
+
+// ── Bug #462 regression: seeded address generation stable across call ordering ──
+
+#[test]
+fn token_call_before_address_does_not_shift_seeded_stream() {
+    use soroban_testkit::core::TestEnv;
+
+    let env_a = TestEnv::with_seed(462);
+    let env_b = TestEnv::with_seed(462);
+
+    // env_a: token first, then addresses
+    let _token = env_a.token();
+    let a1 = env_a.address();
+    let a2 = env_a.address();
+
+    // env_b: addresses only, no token
+    let b1 = env_b.address();
+    let b2 = env_b.address();
+
+    assert_eq!(
+        a1, b1,
+        "first address after token() differs from plain first address — token() is advancing the stream"
+    );
+    assert_eq!(a2, b2, "second address shifted");
+}
+
+#[test]
+fn address_sequence_identical_with_and_without_interleaved_tokens() {
+    use soroban_testkit::core::TestEnv;
+
+    let with_tokens = TestEnv::with_seed(1_000);
+    let without_tokens = TestEnv::with_seed(1_000);
+
+    let _t1 = with_tokens.token();
+    let w1 = with_tokens.address();
+    let _t2 = with_tokens.token();
+    let w2 = with_tokens.address();
+    let _t3 = with_tokens.token();
+
+    let n1 = without_tokens.address();
+    let n2 = without_tokens.address();
+
+    assert_eq!(
+        w1, n1,
+        "interleaved token() before first address shifted stream"
+    );
+    assert_eq!(
+        w2, n2,
+        "interleaved token() between addresses shifted stream"
+    );
+}
+
+#[test]
+fn token_admin_is_distinct_from_all_testenv_generated_addresses() {
+    // The admin must not appear in any address the TestEnv issues, and must
+    // not collide with user-visible addresses.
+    use soroban_testkit::core::TestEnv;
+
+    let env = TestEnv::with_seed(2);
+    let token = env.token();
+    let addrs = env.addresses(10);
+
+    let token_addr = token.address();
+    for addr in &addrs {
+        assert_ne!(
+            addr, &token_addr,
+            "TestToken contract address collided with a TestEnv-generated address"
+        );
+    }
+}

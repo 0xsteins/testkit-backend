@@ -565,6 +565,15 @@ Empirically discovers resource ceilings rather than guessing them.
 soroban-testkit limits --contract <path-to-wasm> --fn <name> --ramp <param> [--arg <name=value> ...]
 ```
 
+The contract path must point to an existing compiled WASM file; `limits` does not
+build contracts. Chain your build and limits invocation with `&&` so a failed
+rebuild cannot lead to measuring an older artifact. Relative paths are resolved
+from the current directory.
+
+Binary refinement assumes success is monotonic up to a resource ceiling. Both
+bracket endpoints are re-probed first; contradictory results stop the command
+with an error. This check cannot establish monotonicity at unprobed values.
+
 Invokes the function with an increasing parameter (e.g. recipient count) until it exceeds resource limits, refines the boundary with binary search, then reports the last successful value plus instruction count and memory at that point. `Bytes` ramp parameters vary by length and contain zero bytes. Use repeatable `--arg NAME=VALUE` options to set non-ramped scalar parameters; values are parsed according to the Soroban type, and `Bytes` values use `0x`-prefixed hexadecimal. These overrides are forwarded to each isolated probe. Unsupported aggregate types produce an actionable error.
 
 **This directly answers the `batch_payout` maximum-recipients question** and is the CLI's most compelling demo. Feature it in the README.

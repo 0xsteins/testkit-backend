@@ -93,7 +93,9 @@ soroban-testkit coverage --format html --open
 soroban-testkit coverage --format json --output coverage.json
 
 # Empirically find how many recipients a batch operation can handle
-# before it exceeds mainnet resource limits.
+# before it exceeds mainnet resource limits. Build successfully first so
+# a failed rebuild cannot leave limits measuring an older WASM artifact.
+cargo build -p my_contract --target wasm32v1-none --release &&
 soroban-testkit limits --contract target/wasm32v1-none/release/my_contract.wasm \
   --fn batch_payout --ramp recipients
 
@@ -108,9 +110,12 @@ soroban-testkit audit ./src --format sarif > audit.sarif
 ```
 
 `limits` ramps numeric and `Bytes` parameters directly, or ramps a `Vec<T>`
-by element count. Use repeated `--arg NAME=VALUE` options for non-ramped
-scalar values; `Bytes` overrides use `0x`-prefixed hex. The command refines
-the first failing ramp value with binary search.
+by element count. `--ramp` must exactly match an input name in the selected
+function's contract ABI. An unknown name is rejected before probes run or
+reports are written, with the available inputs listed for recovery.
+Use repeated `--arg NAME=VALUE` options for non-ramped scalar values;
+`Bytes` overrides use `0x`-prefixed hex. The command refines the first
+failing ramp value with binary search.
 Every ramp attempt runs in its own subprocess: a real `.wasm` contract
 that exceeds resource limits can abort the process outright rather than
 return an error, and isolating each attempt is the only safe way to probe
@@ -131,28 +136,40 @@ reproduction instructions shell-quote paths containing spaces or quotes.
 
 `audit` accepts three scan roots: a crate directory (walked recursively for
 `.rs` files), a single `.rs` file, or `-` to read Rust source from stdin.
-While walking a directory it skips `target/`, `node_modules/`, and hidden
-directories such as `.git/` and `.github/`, so build output and vendored or
-tooling code is never reported. A path that doesn't exist is an actionable
-error rather than an empty "no findings" run.
+While walking a directory it skips `target/`, `vendor/`, `node_modules/`,
+and hidden directories such as `.git/` and `.github/`, keeping build output
+and dependency trees out of recursive scans. A missing path is an actionable
+error rather than an empty "no findings" run. An explicitly selected excluded
+directory or single file is still scanned. Empty, whitespace-only, and
+comment-only Rust files are valid inputs with no findings. Raw identifiers
+such as `r#amount` are checked the same way as their ordinary spellings.
 
 Findings use paths relative to the Cargo workspace root (or the repository
-root or crate root when there is no workspace). The nearest
-`.soroban-testkit.toml` or `soroban-testkit.toml` between the scanned source
-directory and that root supplies rule configuration; the dotted name takes
-precedence in the same directory. Single-file scans start config discovery
-at the file's parent, and stdin scans start at the current directory.
+root or crate root when there is no workspace). Every path the command
+compares or prints is normalized first — symlinks and `.`/`..` components
+resolved — so one file always reports under a single spelling however its
+scan root was spelled on the command line. Findings are then reported in
+one deterministic order — file, then line, then rule, then message — so a
+report diff always reflects a real change rather than scan order. The
+nearest `.soroban-testkit.toml` or `soroban-testkit.toml` between the
+scanned source directory and that root supplies rule configuration; the
+dotted name takes precedence in the same directory. Single-file scans start
+config discovery at the file's parent, and stdin scans start at the current
+directory.
 `--baseline baseline.json` resolves the baseline file from the current
 directory, while its `file` entries are workspace-relative, so one baseline
 works from member crates too. Absolute entries are also accepted.
 
 Unreadable files, directory traversal failures, and Rust parse errors are
 reported separately on stderr with the affected path (and line/column for
-syntax errors). The scan continues through other files and writes their
-findings in the requested format, then exits non-zero to signal an
-incomplete audit even without `--strict`. Fix these errors before treating
-an empty report as a clean scan. JSON reports escape control characters in
-file names and diagnostic text.
+syntax errors). These are *parse warnings*, not findings: a warning means
+the input was skipped rather than scanned, so it never appears in the
+report, never counts toward `finding_count`, and never triggers `--strict`.
+The scan continues through other files and writes their findings in the
+requested format, then exits non-zero to signal an incomplete audit even
+without `--strict`. Fix these warnings before treating an empty report as a
+clean scan. JSON reports escape control characters in file names and
+diagnostic text.
 
 **Audit limitation:** the linter inspects written Rust source only. It does
 not expand procedural macros (including Soroban contract macros) or

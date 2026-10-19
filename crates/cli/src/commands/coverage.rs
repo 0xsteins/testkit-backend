@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -186,23 +186,36 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
     prepare_output_destinations(&args)?;
     let mut cmd = build_command(&args)?;
 
-    let status = cmd.status().map_err(|err| match err.kind() {
-        std::io::ErrorKind::NotFound => CliError(
-            "cargo-llvm-cov is not installed or not found in PATH; \
-                     install it with: cargo install cargo-llvm-cov"
-                .to_string(),
-        ),
+    // Pipe stderr so we can inspect it for actionable diagnostics (e.g.
+    // missing Cargo.toml), while stdout is inherited so live progress output
+    // from cargo-llvm-cov reaches the terminal in real time.
+    cmd.stderr(Stdio::piped());
+
+    let child = cmd.spawn().map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => CliError(identify_missing_coverage_dependency()),
         _ => CliError(format!(
             "failed to run `cargo llvm-cov` ({err}); is cargo-llvm-cov installed? \
                  try `cargo install cargo-llvm-cov`"
         )),
     })?;
 
-    if !status.success() {
+    let output = child
+        .wait_with_output()
+        .map_err(|err| CliError(format!("failed to wait for `cargo llvm-cov`: {err}")))?;
+
+    let captured_stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Forward captured stderr to the terminal so the user sees cargo's output.
+    if !captured_stderr.is_empty() {
+        eprint!("{captured_stderr}");
+    }
+
+    if !output.status.success() {
         return Err(CliError(coverage_failure_message(
-            status,
+            output.status,
             args.open,
             args.fail_under,
+            &captured_stderr,
         )));
     }
 
@@ -360,7 +373,7 @@ pub(crate) fn validate_coverage_outputs(args: &CoverageArgs) -> Result<(), CliEr
                 )));
             }
 
-            let (augmented, summary) = augment_coverage_json(&contents)?;
+            let (augmented, summary) = augment_coverage_json(&contents, &args.exclude)?;
             std::fs::write(&output_path, augmented).map_err(|err| {
                 CliError(format!(
                     "failed to write augmented coverage JSON output to '{}': {err}",
@@ -402,8 +415,20 @@ pub(crate) fn parse_lcov_coverage(contents: &str) -> Option<(usize, usize, f64)>
     }
 }
 
-/// Augments raw llvm-cov JSON export with stable `package_summaries`, `file_summaries`, and `summary` fields.
-pub fn augment_coverage_json(raw_json: &str) -> Result<(String, CoverageSummary), CliError> {
+/// Augments raw llvm-cov JSON export with stable `package_summaries`, `file_summaries`, and
+/// `summary` fields.
+///
+/// `excluded_packages` is the list of package names passed via `--exclude`. Files whose
+/// inferred package name appears in this list are omitted from all summaries so that
+/// excluded packages are never counted as uncovered lines — they were deliberately left
+/// out of instrumentation and must not skew the coverage percentage or `--fail-under`
+/// checks. Files with zero instrumentable lines (`lines_total == 0`) are also excluded
+/// from summaries for the same reason: they represent uninstrumented units, not uncovered
+/// ones.
+pub fn augment_coverage_json(
+    raw_json: &str,
+    excluded_packages: &[String],
+) -> Result<(String, CoverageSummary), CliError> {
     let mut root: serde_json::Value = serde_json::from_str(raw_json)
         .map_err(|err| CliError(format!("failed to parse coverage JSON output: {err}")))?;
 
@@ -430,14 +455,30 @@ pub fn augment_coverage_json(raw_json: &str) -> Result<(String, CoverageSummary)
                         .and_then(|l| l.get("covered"))
                         .and_then(|c| c.as_u64())
                         .unwrap_or(0) as usize;
-                    let line_percent = if lines_total > 0 {
-                        lines_summary
-                            .and_then(|l| l.get("percent"))
-                            .and_then(|p| p.as_f64())
-                            .unwrap_or_else(|| (lines_covered as f64 / lines_total as f64) * 100.0)
-                    } else {
-                        100.0
-                    };
+
+                    // Skip files with no instrumentable lines — they are not "uncovered",
+                    // they simply have nothing to measure (e.g. re-export-only modules,
+                    // proc-macro crates, or build scripts). Including them would inflate
+                    // `lines_total` with zeros while contributing nothing meaningful to
+                    // the coverage percentage.
+                    if lines_total == 0 {
+                        continue;
+                    }
+
+                    // Skip files that belong to explicitly excluded packages. cargo-llvm-cov
+                    // may still emit entries for packages that were excluded via --exclude
+                    // (e.g. because they were compiled as transitive dependencies). Counting
+                    // those entries as uncovered would produce a misleading percentage and
+                    // cause spurious --fail-under failures.
+                    let pkg = infer_package_name(&filename);
+                    if excluded_packages.iter().any(|ex| ex == &pkg) {
+                        continue;
+                    }
+
+                    let line_percent = lines_summary
+                        .and_then(|l| l.get("percent"))
+                        .and_then(|p| p.as_f64())
+                        .unwrap_or_else(|| (lines_covered as f64 / lines_total as f64) * 100.0);
 
                     total_covered += lines_covered;
                     total_lines += lines_total;
@@ -548,10 +589,44 @@ fn validate_html_output(output_dir: Option<&std::path::Path>) -> Result<(), CliE
     Ok(())
 }
 
+/// Returns true if the stderr output from cargo indicates a project metadata
+/// failure (missing or unreadable `Cargo.toml`, invalid manifest, workspace
+/// resolution error) rather than a coverage-specific failure.
+pub(crate) fn is_metadata_error(cargo_stderr: &str) -> bool {
+    // Patterns emitted by cargo when it cannot locate or parse project metadata.
+    const METADATA_PATTERNS: &[&str] = &[
+        "could not find `Cargo.toml`",
+        "could not find Cargo.toml",
+        "error: manifest path",
+        "failed to parse manifest",
+        "failed to read",
+        "no such file or directory",
+        "error reading",
+        "workspace manifest",
+        "current package believes it's in a workspace when it's not",
+    ];
+    let lower = cargo_stderr.to_ascii_lowercase();
+    METADATA_PATTERNS
+        .iter()
+        .any(|pat| lower.contains(&pat.to_ascii_lowercase()))
+}
+
+fn identify_missing_coverage_dependency() -> String {
+    format!(
+        "cargo-llvm-cov is not installed or not found in PATH.\n\
+         This tool requires two components:\n\
+         1. The cargo-llvm-cov binary: install with `cargo install cargo-llvm-cov`\n\
+         2. LLVM tools for your toolchain: install with `rustup component add llvm-tools-preview`\n\
+         If you have installed cargo-llvm-cov, check that it is in your PATH or the Rust toolchain directory.\n\
+         For more help, see: https://github.com/taiki-e/cargo-llvm-cov#installation"
+    )
+}
+
 fn coverage_failure_message(
     status: std::process::ExitStatus,
     open_requested: bool,
     fail_under: Option<f64>,
+    cargo_stderr: &str,
 ) -> String {
     #[cfg(unix)]
     {
@@ -560,6 +635,17 @@ fn coverage_failure_message(
         if let Some(signal) = status.signal() {
             return format!("coverage run terminated by signal {signal}");
         }
+    }
+
+    // Check for missing project metadata before any other heuristic — this is
+    // a setup problem, not a coverage problem, and deserves its own message.
+    if is_metadata_error(cargo_stderr) {
+        return format!(
+            "coverage run failed (cargo llvm-cov exited with {status}); \
+             cargo could not read project metadata — verify that a `Cargo.toml` \
+             exists in the current directory or a parent, and that the manifest is valid \
+             (`cargo metadata` can confirm this independently)"
+        );
     }
 
     if let Some(expected) = fail_under {
@@ -793,12 +879,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn output_path_with_spaces_in_name() {
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        a.output = Some(std::path::PathBuf::from("my output file.json"));
+        let cmd = build_command(&a).unwrap();
+        let rendered = rendered_args(&cmd);
+        assert!(
+            rendered.contains(&"my output file.json".to_string()),
+            "path with spaces should be preserved: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn output_dir_with_spaces_in_json() {
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        a.output_dir = Some(std::path::PathBuf::from("my coverage reports"));
+        let cmd = build_command(&a).unwrap();
+        let rendered = rendered_args(&cmd);
+        assert_eq!(
+            rendered,
+            vec![
+                "llvm-cov",
+                "test",
+                "--json",
+                "--output-path",
+                "my coverage reports/coverage.json",
+            ]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn signal_termination_is_reported_distinctly() {
         use std::os::unix::process::ExitStatusExt;
 
-        let message = coverage_failure_message(std::process::ExitStatus::from_raw(9), false, None);
+        let message =
+            coverage_failure_message(std::process::ExitStatus::from_raw(9), false, None, "");
         assert_eq!(message, "coverage run terminated by signal 9");
     }
 
@@ -1080,24 +1199,94 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
 
         let status = std::process::ExitStatus::from_raw(256); // exit code 1
-        let msg_normal = coverage_failure_message(status, false, None);
+        let msg_normal = coverage_failure_message(status, false, None, "");
         assert!(
             msg_normal.contains("if no source files were instrumented"),
             "{msg_normal}"
         );
 
-        let msg_open = coverage_failure_message(status, true, None);
+        let msg_open = coverage_failure_message(status, true, None, "");
         assert!(
             msg_open.contains("HTML report was not generated so the browser will not be opened"),
             "{msg_open}"
         );
         assert!(!msg_open.contains("desktop browser opener"), "{msg_open}");
 
-        let msg_fail_under = coverage_failure_message(status, false, Some(85.5));
+        let msg_fail_under = coverage_failure_message(status, false, Some(85.5), "");
         assert!(
             msg_fail_under.contains("--fail-under threshold of 85.50%"),
             "{msg_fail_under}"
         );
+    }
+
+    #[test]
+    fn coverage_failure_message_distinguishes_missing_metadata_from_missing_tool() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(256); // exit code 1
+
+        // Metadata error: cargo cannot find Cargo.toml
+        let stderr_no_toml =
+            "error: could not find `Cargo.toml` in `/tmp/empty` or any parent directory";
+        let msg = coverage_failure_message(status, false, None, stderr_no_toml);
+        assert!(
+            msg.contains("cargo could not read project metadata"),
+            "expected metadata error message, got: {msg}"
+        );
+        assert!(
+            msg.contains("Cargo.toml"),
+            "message should mention Cargo.toml: {msg}"
+        );
+        assert!(
+            msg.contains("cargo metadata"),
+            "message should suggest cargo metadata: {msg}"
+        );
+        // Must NOT suggest instrumentation/filter issues for a metadata problem
+        assert!(
+            !msg.contains("no source files were instrumented"),
+            "metadata error should not suggest instrumentation issues: {msg}"
+        );
+
+        // Metadata error: invalid manifest
+        let stderr_bad_manifest =
+            "error: failed to parse manifest at `/home/user/project/Cargo.toml`";
+        let msg2 = coverage_failure_message(status, false, None, stderr_bad_manifest);
+        assert!(
+            msg2.contains("cargo could not read project metadata"),
+            "failed to parse manifest should be treated as metadata error: {msg2}"
+        );
+
+        // Non-metadata error: generic coverage failure
+        let stderr_generic = "error: some llvm error occurred";
+        let msg3 = coverage_failure_message(status, false, None, stderr_generic);
+        assert!(
+            msg3.contains("if no source files were instrumented"),
+            "non-metadata error should use generic message: {msg3}"
+        );
+        assert!(
+            !msg3.contains("cargo could not read project metadata"),
+            "non-metadata error must not claim metadata problem: {msg3}"
+        );
+    }
+
+    #[test]
+    fn is_metadata_error_detects_known_cargo_patterns() {
+        assert!(is_metadata_error(
+            "error: could not find `Cargo.toml` in `/tmp`"
+        ));
+        assert!(is_metadata_error("error: could not find Cargo.toml"));
+        assert!(is_metadata_error(
+            "error: manifest path `/bad` does not exist"
+        ));
+        assert!(is_metadata_error(
+            "error: failed to parse manifest at `/project/Cargo.toml`"
+        ));
+        assert!(!is_metadata_error(
+            "error: some llvm-cov instrumentation failure"
+        ));
+        assert!(!is_metadata_error("error: failed to compile test binary"));
+        assert!(!is_metadata_error(""));
     }
 
     #[test]
@@ -1172,7 +1361,7 @@ mod tests {
             ]
         }"#;
 
-        let (augmented, summary) = augment_coverage_json(raw_json).unwrap();
+        let (augmented, summary) = augment_coverage_json(raw_json, &[]).unwrap();
         assert_eq!(summary.lines_total, 350);
         assert_eq!(summary.lines_covered, 280);
         assert!((summary.line_percent - 80.0).abs() < 1e-4);
@@ -1191,6 +1380,170 @@ mod tests {
         assert_eq!(files[0]["lines_covered"], 85);
         assert_eq!(files[0]["lines_total"], 100);
         assert_eq!(files[0]["line_percent"], 85.0);
+    }
+
+    // ── Bug #461 regression: excluded files must not be treated as uncovered ──
+
+    #[test]
+    fn augment_coverage_json_skips_zero_line_files_from_summary() {
+        // Files with lines_total == 0 (e.g. re-export modules, proc-macro crates,
+        // build scripts) must not inflate lines_total or drag down line_percent.
+        let raw_json = r#"{
+            "data": [{
+                "files": [
+                    {
+                        "filename": "crates/testkit/src/lib.rs",
+                        "summary": { "lines": { "count": 100, "covered": 80, "percent": 80.0 } }
+                    },
+                    {
+                        "filename": "crates/testkit/src/reexport.rs",
+                        "summary": { "lines": { "count": 0, "covered": 0, "percent": 0.0 } }
+                    }
+                ]
+            }]
+        }"#;
+
+        let (augmented, summary) = augment_coverage_json(raw_json, &[]).unwrap();
+
+        // Zero-line file must not appear in file_summaries or package_summaries.
+        let parsed: serde_json::Value = serde_json::from_str(&augmented).unwrap();
+        let files = parsed["file_summaries"].as_array().unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "zero-line file must be excluded from file_summaries"
+        );
+        assert_eq!(files[0]["filename"], "crates/testkit/src/lib.rs");
+
+        // Totals must only reflect the one instrumented file.
+        assert_eq!(summary.lines_total, 100);
+        assert_eq!(summary.lines_covered, 80);
+        assert!((summary.line_percent - 80.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn augment_coverage_json_excluded_packages_not_counted_as_uncovered() {
+        // When --exclude cli is passed, files from the cli package that appear in
+        // the JSON (because cargo compiled them as dependencies) must not be counted
+        // as uncovered lines, even if their covered count is zero.
+        let raw_json = r#"{
+            "data": [{
+                "files": [
+                    {
+                        "filename": "crates/testkit/src/lib.rs",
+                        "summary": { "lines": { "count": 100, "covered": 80, "percent": 80.0 } }
+                    },
+                    {
+                        "filename": "crates/cli/src/main.rs",
+                        "summary": { "lines": { "count": 200, "covered": 0, "percent": 0.0 } }
+                    }
+                ]
+            }]
+        }"#;
+
+        // Without exclusion: cli's 200 uncovered lines drag the percentage down.
+        let (_, summary_all) = augment_coverage_json(raw_json, &[]).unwrap();
+        assert_eq!(summary_all.lines_total, 300);
+        assert_eq!(summary_all.lines_covered, 80);
+        assert!((summary_all.line_percent - (80.0 / 300.0 * 100.0)).abs() < 1e-4);
+
+        // With --exclude cli: only testkit lines are counted.
+        let (augmented, summary_excl) =
+            augment_coverage_json(raw_json, &["cli".to_string()]).unwrap();
+        assert_eq!(
+            summary_excl.lines_total, 100,
+            "excluded package lines must not inflate total"
+        );
+        assert_eq!(summary_excl.lines_covered, 80);
+        assert!(
+            (summary_excl.line_percent - 80.0).abs() < 1e-4,
+            "excluded package must not reduce line_percent: {}",
+            summary_excl.line_percent
+        );
+
+        // Excluded file must not appear in file_summaries.
+        let parsed: serde_json::Value = serde_json::from_str(&augmented).unwrap();
+        let files = parsed["file_summaries"].as_array().unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "excluded package file must be absent from file_summaries"
+        );
+        assert_eq!(files[0]["filename"], "crates/testkit/src/lib.rs");
+
+        let pkgs = parsed["package_summaries"].as_array().unwrap();
+        assert_eq!(
+            pkgs.len(),
+            1,
+            "excluded package must be absent from package_summaries"
+        );
+        assert_eq!(pkgs[0]["package_name"], "testkit");
+    }
+
+    #[test]
+    fn augment_coverage_json_multiple_excluded_packages() {
+        let raw_json = r#"{
+            "data": [{
+                "files": [
+                    {
+                        "filename": "crates/testkit/src/lib.rs",
+                        "summary": { "lines": { "count": 100, "covered": 90, "percent": 90.0 } }
+                    },
+                    {
+                        "filename": "crates/cli/src/main.rs",
+                        "summary": { "lines": { "count": 50, "covered": 0, "percent": 0.0 } }
+                    },
+                    {
+                        "filename": "crates/audit/src/lib.rs",
+                        "summary": { "lines": { "count": 80, "covered": 0, "percent": 0.0 } }
+                    }
+                ]
+            }]
+        }"#;
+
+        let (_, summary) =
+            augment_coverage_json(raw_json, &["cli".to_string(), "audit".to_string()]).unwrap();
+
+        assert_eq!(summary.lines_total, 100);
+        assert_eq!(summary.lines_covered, 90);
+        assert!((summary.line_percent - 90.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn augment_coverage_json_excluded_and_zero_line_combined() {
+        // Both exclusions apply independently: zero-line files are always dropped,
+        // named excluded packages are always dropped, regardless of order.
+        let raw_json = r#"{
+            "data": [{
+                "files": [
+                    {
+                        "filename": "crates/testkit/src/lib.rs",
+                        "summary": { "lines": { "count": 100, "covered": 75, "percent": 75.0 } }
+                    },
+                    {
+                        "filename": "crates/cli/src/mod.rs",
+                        "summary": { "lines": { "count": 0, "covered": 0, "percent": 0.0 } }
+                    },
+                    {
+                        "filename": "crates/audit/src/lib.rs",
+                        "summary": { "lines": { "count": 60, "covered": 0, "percent": 0.0 } }
+                    }
+                ]
+            }]
+        }"#;
+
+        let (augmented, summary) = augment_coverage_json(raw_json, &["audit".to_string()]).unwrap();
+
+        // Only testkit/lib.rs survives: cli/mod.rs is dropped (zero lines),
+        // audit/lib.rs is dropped (excluded package).
+        assert_eq!(summary.lines_total, 100);
+        assert_eq!(summary.lines_covered, 75);
+        assert!((summary.line_percent - 75.0).abs() < 1e-4);
+
+        let parsed: serde_json::Value = serde_json::from_str(&augmented).unwrap();
+        let files = parsed["file_summaries"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["filename"], "crates/testkit/src/lib.rs");
     }
 
     #[test]
@@ -1284,7 +1637,7 @@ mod tests {
         #[cfg(unix)]
         use std::os::unix::process::ExitStatusExt;
         let status = std::process::ExitStatus::from_raw(256); // exit code 1
-        let msg = coverage_failure_message(status, true, None);
+        let msg = coverage_failure_message(status, true, None, "");
         assert!(
             msg.contains("HTML report was not generated so the browser will not be opened"),
             "failure message should mention browser will not be opened: {msg}"

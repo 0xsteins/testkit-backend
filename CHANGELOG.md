@@ -101,6 +101,21 @@ section, so a merge can never land without a place to record the change.
 
 ### Fixed
 
+- Exclude `vendor/` alongside `target/` from recursive `audit` scans while
+  honoring explicitly selected scan roots (#427).
+- Apply audit rules consistently to raw Rust identifiers, including types,
+  bindings, and method names (#434).
+- Guard empty-source audit behavior across file, directory, and stdin scans
+  in every output format (#435).
+- Explain how to recover from a `limits --ramp` name missing from the selected
+  function's ABI, including functions with no inputs; guard rejection before
+  probes or report writes (#441).
+- Validate the `limits` success/failure bracket before binary refinement and
+  report unstable probe results with recovery guidance (#442).
+- Clamp doubled ramp values to the search cap without integer overflow (#443).
+- Rebuild the limits test fixture before use and reject failed rebuilds even
+  when an older WASM artifact exists (#449).
+- Explain how to recover from a missing or unreadable `--contract` file (#450).
 - Keep `audit` findings and baseline paths relative to the workspace, and
   discover rule configuration consistently for directories, files, and stdin
   (#428). Continue scanning readable files after source or traversal errors,

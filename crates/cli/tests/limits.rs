@@ -24,10 +24,14 @@ fn run(args: &[&str]) -> Output {
         .expect("failed to run soroban-testkit")
 }
 
+// Cargo checks freshness, even when a previous build left an artifact behind.
+// Share one successful build across the tests without racing multiple rebuilds.
 fn ensure_vault_wasm() -> PathBuf {
-    let wasm = workspace_root().join("target/wasm32v1-none/release/vault.wasm");
-    if !wasm.exists() {
-        let build = Command::new("cargo")
+    static WASM: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    WASM.get_or_init(|| {
+        let wasm = workspace_root().join("target/wasm32v1-none/release/vault.wasm");
+        let mut build = Command::new("cargo");
+        build
             // The outer cargo-llvm-cov run instruments native tests. This nested
             // WASM fixture build must not inherit its unsupported coverage flags.
             .env_remove("RUSTFLAGS")
@@ -41,16 +45,28 @@ fn ensure_vault_wasm() -> PathBuf {
                 "wasm32v1-none",
                 "--release",
             ])
-            .current_dir(workspace_root())
-            .status()
-            .expect("failed to build vault.wasm");
-        assert!(
-            build.success(),
-            "failed to compile examples/vault for documented wasm target `wasm32v1-none`. \
-             Ensure the target is installed: `rustup target add wasm32v1-none`."
-        );
+            .current_dir(workspace_root());
+        require_successful_build(&mut build, &wasm).unwrap_or_else(|err| panic!("{err}"))
+    })
+    .clone()
+}
+
+fn require_successful_build(build: &mut Command, wasm: &Path) -> Result<PathBuf, String> {
+    let output = build
+        .output()
+        .map_err(|err| format!("failed to build {}: {err}", wasm.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to rebuild {}; refusing to use a stale wasm. Ensure the target is installed: \
+             `rustup target add wasm32v1-none`. Build stderr: {}",
+            wasm.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
-    wasm
+    if !wasm.is_file() {
+        return Err(format!("build succeeded but {} is missing", wasm.display()));
+    }
+    Ok(wasm.to_path_buf())
 }
 
 #[test]
@@ -60,6 +76,7 @@ fn limits_help_documents_options_and_limitations() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(stdout.contains("--contract"), "{stdout}");
+    assert!(stdout.contains("does not rebuild contracts"), "{stdout}");
     assert!(stdout.contains("--fn"), "{stdout}");
     assert!(stdout.contains("--ramp"), "{stdout}");
     assert!(stdout.contains("--arg"), "{stdout}");
@@ -134,6 +151,107 @@ fn limits_rejects_unknown_function_with_available_list() {
     );
     assert!(stderr.contains("available functions:"), "{stderr}");
     assert!(stderr.contains("batch_payout"), "{stderr}");
+}
+
+#[test]
+fn limits_rejects_unknown_ramp_before_probing_or_writing_reports() {
+    let wasm = ensure_vault_wasm();
+    let root = std::env::temp_dir().join(format!("stk-limits-unknown-ramp-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let export = root.join("report.json");
+    let baseline = root.join("baseline.txt");
+    std::fs::write(&export, "existing export").unwrap();
+    std::fs::write(&baseline, "existing baseline").unwrap();
+
+    // `owner` exists on initialize, but not on the selected function.
+    for ramp in ["recipents", "Recipients", "owner", ""] {
+        let output = run(&[
+            "limits",
+            "--contract",
+            wasm.to_str().unwrap(),
+            "--fn",
+            "batch_payout",
+            "--ramp",
+            ramp,
+            "--probe-timeout",
+            "0",
+            "--arg",
+            "unknown=1",
+            "--export",
+            export.to_str().unwrap(),
+            "--save-baseline",
+            baseline.to_str().unwrap(),
+        ]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            stderr.contains(&format!("\"batch_payout\" has no parameter named {ramp:?}")),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("available parameters: recipients, amount"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("--ramp"), "{stderr}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(std::fs::read_to_string(&export).unwrap(), "existing export");
+        assert_eq!(
+            std::fs::read_to_string(&baseline).unwrap(),
+            "existing baseline"
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn limits_explains_when_the_selected_function_has_no_rampable_parameters() {
+    let wasm = ensure_vault_wasm();
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "balance",
+        "--ramp",
+        "env",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        stderr.contains("\"balance\" has no parameter named \"env\""),
+        "{stderr}"
+    );
+    assert!(stderr.contains("available parameters: (none)"), "{stderr}");
+    assert!(
+        stderr.contains("choose a function with a numeric, Bytes, or Vec parameter"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "{output:?}");
+}
+
+#[test]
+fn limits_accepts_a_non_first_parameter_name_from_the_selected_abi() {
+    let wasm = ensure_vault_wasm();
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "amount",
+        "--arg",
+        "amount=10",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{output:?}");
+    // Reaching override validation proves the ABI lookup accepted `amount`.
+    assert!(
+        stderr.contains("--arg cannot override ramp parameter \"amount\""),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no parameter named"), "{stderr}");
 }
 
 #[test]
@@ -496,6 +614,67 @@ fn limits_includes_failed_probe_stderr_in_json_export() {
 }
 
 #[test]
+fn limits_missing_contract_reports_path_and_recovery_without_writing_reports() {
+    let dir = std::env::temp_dir().join(format!("stk-missing-contract-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for contract in [
+        "missing.wasm",
+        "missing directory/contract with spaces.wasm",
+    ] {
+        let export = dir.join("result.json");
+        let baseline = dir.join("baseline.txt");
+        let output = Command::new(env!("CARGO_BIN_EXE_soroban-testkit"))
+            .current_dir(&dir)
+            .args([
+                "limits",
+                "--contract",
+                contract,
+                "--fn",
+                "batch_payout",
+                "--ramp",
+                "recipients",
+                "--export",
+                export.to_str().unwrap(),
+                "--save-baseline",
+                baseline.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(contract), "{stderr}");
+        assert!(stderr.contains("contract file not found"), "{stderr}");
+        assert!(stderr.contains("current directory"), "{stderr}");
+        assert!(
+            stderr.contains("build the contract successfully"),
+            "{stderr}"
+        );
+        assert!(output.stdout.is_empty());
+        assert!(!export.exists());
+        assert!(!baseline.exists());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn limits_rejects_a_directory_as_contract() {
+    let output = run(&[
+        "limits",
+        "--contract",
+        ".",
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("readable .wasm file"), "{stderr}");
+    assert!(!stderr.contains("contract file not found"), "{stderr}");
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
 fn limits_launches_wasm_from_a_path_with_spaces_without_shell_splitting() {
     let wasm = ensure_vault_wasm();
     let root = std::env::temp_dir().join(format!("stk limit paths {}", std::process::id()));
@@ -523,6 +702,43 @@ fn limits_launches_wasm_from_a_path_with_spaces_without_shell_splitting() {
         "copyable guidance must quote the filename: {stdout}"
     );
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_rebuild_never_falls_back_to_stale_wasm() {
+    let dir = std::env::temp_dir().join(format!("stk-rebuild-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let wasm = dir.join("vault.wasm");
+    std::fs::write(&wasm, b"old wasm").unwrap();
+    let mut failed_build = Command::new("sh");
+    failed_build.args(["-c", "echo compiler-error >&2; exit 1"]);
+    let err = require_successful_build(&mut failed_build, &wasm).unwrap_err();
+    assert!(err.contains("refusing to use a stale wasm"), "{err}");
+    assert!(err.contains("compiler-error"), "{err}");
+    assert_eq!(std::fs::read(&wasm).unwrap(), b"old wasm");
+
+    let mut successful_build = Command::new("sh");
+    successful_build
+        .args(["-c", "printf 'new wasm' > \"$1\"", "build"])
+        .arg(&wasm);
+    assert_eq!(
+        require_successful_build(&mut successful_build, &wasm).unwrap(),
+        wasm
+    );
+    assert_eq!(std::fs::read(&wasm).unwrap(), b"new wasm");
+
+    std::fs::remove_file(&wasm).unwrap();
+    let mut missing_artifact = Command::new("sh");
+    missing_artifact.args(["-c", "exit 0"]);
+    assert!(require_successful_build(&mut missing_artifact, &wasm)
+        .unwrap_err()
+        .contains("is missing"));
+    let mut missing_builder = Command::new(dir.join("missing-cargo"));
+    assert!(require_successful_build(&mut missing_builder, &wasm)
+        .unwrap_err()
+        .contains("failed to build"));
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
